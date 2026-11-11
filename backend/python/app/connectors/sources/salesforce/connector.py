@@ -7,9 +7,9 @@ import base64
 
 from logging import Logger
 from typing import Any, AsyncGenerator, Callable, DefaultDict, Dict, List, Optional, Set, Tuple, Type, TypeAlias, TypeVar
-from urllib.parse import parse_qsl, quote, urlsplit
+from urllib.parse import quote
 from uuid import uuid4
-from app.utils.html_markdown import html_to_markdown, html_to_markdown_async
+from html_to_markdown import convert as html_to_markdown  # type: ignore[import-untyped]
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
@@ -27,7 +27,6 @@ from app.config.constants.arangodb import (
 from app.config.constants.http_status_code import HttpStatusCode
 from app.connectors.core.constants import IconPaths
 from app.connectors.core.base.connector.connector_service import BaseConnector
-from app.connectors.core.sync.full_sync_coverage import FullSyncCoverage
 from app.connectors.core.base.data_processor.data_source_entities_processor import (
     DataSourceEntitiesProcessor,
 )
@@ -64,21 +63,7 @@ from app.connectors.core.registry.filters import (
     SyncFilterKey,
     load_connector_filters,
 )
-from app.connectors.sources.salesforce.api_errors import SalesforceRequestFailed, salesforce_error
 from app.connectors.sources.salesforce.common.apps import SalesforceApp
-from app.connectors.sources.salesforce.deletions import SalesforceDeletions
-from app.connectors.sources.salesforce.eligibility import SalesforceEligibility
-from app.connectors.sources.salesforce.file_links import SalesforceFileLinks
-from app.connectors.sources.salesforce.sync_notices import (
-    ACCESS_KEPT,
-    CHATTER_NEEDS_VIEW_ALL,
-    Notice,
-    SyncProblems,
-    stopped_sync_notice,
-    unreadable_list,
-)
-from app.connectors.sources.salesforce.sync_window import checkpoint_for
-from app.connectors.sources.salesforce.sync_window import soql_datetime as to_soql_datetime
 from app.exceptions.graph_db_exceptions import GraphQueryError
 from app.models.entities import (
     AppRole,
@@ -94,8 +79,8 @@ from app.models.entities import (
     RecordGroupType,
     RecordType,
     TicketRecord,
+    WebpageRecord,
 )
-from app.modules.entity_resolution.organizations import accounts_last, extracted_organization_id
 from collections import defaultdict
 
 from app.models.blocks import (
@@ -109,24 +94,17 @@ from app.models.blocks import (
     GroupType,
 )
 from app.models.permission import EntityType, Permission, PermissionType
-from app.services.notification.types import (
-    NotificationOutcome,
-    NotificationRecipientRole,
-    NotificationSeverity,
-    NotificationType,
-)
 from app.sources.client.http.address_guard import AddressNotAllowedError, guarded_async_client
 from app.sources.client.salesforce.salesforce import (
     SalesforceClient,
     SalesforceConfig,
-    SalesforceResponse,
 )
 from app.connectors.core.base.token_service.startup_service import startup_service
 from app.connectors.utils.html_utils import embed_html_images_as_base64
 from app.sources.external.salesforce.salesforce_data_source import SalesforceDataSource
 from app.services.cache.invalidation_hooks import notify_connector_permissions_changed
 from app.utils.streaming import create_stream_record_response
-from app.utils.time_conversion import get_epoch_timestamp_in_ms, parse_timestamp
+from app.utils.time_conversion import epoch_ms_to_iso, get_epoch_timestamp_in_ms, parse_timestamp
 
 
 # ---------------------------------------------------------------------------
@@ -470,14 +448,12 @@ class SalesforceLineItem(BaseModel):
 
 class SalesforceFeedRecord(BaseModel):
     """A FeedItem / FeedComment row used solely to accumulate the per-parent
-    latest-comment epoch.  A reply or an edit moves the post's SystemModstamp, not its
-    CreatedDate (seen live), so SystemModstamp wins when present."""
+    latest-comment epoch.  Only ParentId and CreatedDate are ever accessed."""
 
     model_config = ConfigDict(extra="ignore")
 
     ParentId: Optional[str] = None
     CreatedDate: Optional[str] = None
-    SystemModstamp: Optional[str] = None
 
 
 class SalesforceLinkedEntity(BaseModel):
@@ -579,10 +555,189 @@ TASKS_SYNC_POINT_KEY = "tasks"
 FILES_SYNC_POINT_KEY = "files"
 ACCOUNTS_SYNC_POINT_KEY = "accounts"
 DISCUSSIONS_SYNC_POINT_KEY = "discussions"
-FROZEN_USERS_SYNC_POINT_KEY = "frozen_users"
-FILES_LAYOUT_SYNC_POINT_KEY = "files_layout"
-# Files moved out of the org-wide files group into their parent's group (FILES_LAYOUT 2).
-FILES_LAYOUT_VERSION = 2
+
+
+# --------------- Custom Objects (Candidate ATS, etc.) ---------------
+
+_CUSTOM_OBJECT_EXCLUDED_SUFFIXES: Tuple[str, ...] = (
+    "__Share",
+    "__History",
+    "__Feed",
+    "__Tag",
+    "__ChangeEvent",
+    "__hd",
+    "__x",
+    "__b",
+    "__e",
+    "__mdt",
+    "__DataCategorySelection",
+    "__VoteStat",
+    "__ViewStat",
+    "__ka",
+    "__kav",
+    "__DataCategoryGroupSelection",
+)
+
+# Field types safe to SELECT as scalar values in SOQL and render as text.
+_CUSTOM_OBJECT_FIELD_TYPES: frozenset = frozenset({
+    "id", "string", "textarea", "email", "phone", "url", "picklist",
+    "multipicklist", "combobox", "boolean", "int", "double", "currency",
+    "percent", "date", "datetime", "time", "reference", "encryptedstring",
+})
+
+_CUSTOM_OBJECTS_SYNC_POINT_PREFIX = "custom_object:"
+_CUSTOM_OBJECT_GROUP_PREFIX = "sf-custom:"
+
+
+def _is_syncable_custom_sobject(meta: Dict[str, Any]) -> bool:
+    """Return True for queryable custom business objects (not history/share/etc.)."""
+    name = meta.get("name") or ""
+    if not meta.get("custom"):
+        return False
+    if not meta.get("queryable") or not meta.get("retrieveable"):
+        return False
+    if meta.get("deprecatedAndHidden"):
+        return False
+    for suffix in _CUSTOM_OBJECT_EXCLUDED_SUFFIXES:
+        if name.endswith(suffix):
+            return False
+    # Skip Salesforce platform / setup-ish custom objects that are never ATS data.
+    lower = name.lower()
+    if lower.startswith("apex") or "purposetxt" in lower:
+        return False
+    return True
+
+
+def _pick_custom_object_name_field(fields: List[Dict[str, Any]]) -> Optional[str]:
+    """Choose the best display-name field for a custom object row."""
+    by_name = {f.get("name"): f for f in fields if f.get("name")}
+    for candidate in ("Name", "Title__c", "Title", "Subject__c", "Subject", "Full_Name__c", "Candidate_Name__c"):
+        if candidate in by_name and by_name[candidate].get("type") in _CUSTOM_OBJECT_FIELD_TYPES:
+            return candidate
+    # nameField flag from describe
+    for f in fields:
+        if f.get("nameField") and f.get("name") and f.get("type") in _CUSTOM_OBJECT_FIELD_TYPES:
+            return f["name"]
+    return None
+
+
+def _select_custom_object_fields(fields: List[Dict[str, Any]], max_fields: int = 80) -> List[str]:
+    """Pick a bounded set of SOQL-safe fields for indexing custom object rows."""
+    selected: List[str] = []
+    required = ["Id"]
+    for name in ("CreatedDate", "LastModifiedDate", "SystemModstamp"):
+        if any(f.get("name") == name for f in fields):
+            required.append(name)
+    name_field = _pick_custom_object_name_field(fields)
+    if name_field and name_field not in required:
+        required.append(name_field)
+
+    for name in required:
+        if name not in selected:
+            selected.append(name)
+
+    # Prefer text-ish fields next, then other scalars.
+    textish = []
+    other = []
+    for f in fields:
+        fname = f.get("name")
+        ftype = (f.get("type") or "").lower()
+        if not fname or fname in selected:
+            continue
+        if not f.get("filterable", True) and ftype not in _CUSTOM_OBJECT_FIELD_TYPES:
+            continue
+        if ftype not in _CUSTOM_OBJECT_FIELD_TYPES:
+            continue
+        if f.get("calculated") and ftype not in {"string", "textarea", "double", "currency", "percent", "boolean", "int"}:
+            continue
+        bucket = textish if ftype in {"string", "textarea", "email", "phone", "url", "picklist", "multipicklist"} else other
+        bucket.append(fname)
+
+    for fname in textish + other:
+        if len(selected) >= max_fields:
+            break
+        selected.append(fname)
+    return selected
+
+
+def _format_custom_object_markdown(
+    api_name: str,
+    label: str,
+    row: Dict[str, Any],
+    name_field: Optional[str],
+) -> Tuple[str, str]:
+    """Return (record_name, markdown_body) for a custom object row."""
+    display = None
+    if name_field and row.get(name_field):
+        display = str(row.get(name_field))
+    if not display:
+        display = str(row.get("Name") or row.get("Id") or api_name)
+    lines = [f"# {display}", "", f"**Salesforce object:** {label} (`{api_name}`)", ""]
+    skip = {"attributes", "Id"}
+    for key, value in row.items():
+        if key in skip or value is None or value == "":
+            continue
+        if isinstance(value, dict):
+            # relationship stub — keep Name if present
+            nested_name = value.get("Name") or value.get("Id")
+            if nested_name:
+                lines.append(f"- **{key}:** {nested_name}")
+            continue
+        text = str(value)
+        if len(text) > 4000:
+            text = text[:4000] + "…"
+        lines.append(f"- **{key}:** {text}")
+    return display, "\n".join(lines)
+
+
+
+# Account SELECT fields that are core to every Salesforce org. Fields that exist in
+# only some orgs (Data.com's DunsNumber, FLS-restricted fields, managed-package
+# fields, or standard picklists hidden by profile) are appended at runtime only
+# when the org actually serves them -- see _resolve_optional_account_fields().
+# A hardcoded list that names an unavailable field makes Salesforce reject the
+# whole SOQL statement with HTTP 400.
+_ACCOUNT_REQUIRED_FIELDS: Tuple[str, ...] = (
+    "Id", "Name", "Owner.Name", "CreatedDate", "LastModifiedDate", "SystemModstamp",
+)
+
+# Preferred optional fields, queried only when the Account describe call reports
+# them as present. Ordered by value to this connector. Type/Rating/Website/
+# Industry/Ownership/Phone are standard but often FLS-hidden; ParentId backs
+# the account hierarchy; DunsNumber is the D-U-N-S id carried onto the Org node.
+_ACCOUNT_OPTIONAL_FIELDS: Tuple[str, ...] = (
+    "Type", "Rating", "Website", "Industry", "Ownership", "Phone",
+    "ParentId", "DunsNumber",
+)
+
+# Contact SELECT: Email is required by this connector to build Person nodes, but
+# Title/Department/Description/LeadSource are frequently FLS-hidden.
+_CONTACT_REQUIRED_FIELDS: Tuple[str, ...] = (
+    "Id", "FirstName", "LastName", "Email", "Phone", "AccountId", "Account.Name",
+    "CreatedDate", "LastModifiedDate",
+)
+_CONTACT_OPTIONAL_FIELDS: Tuple[str, ...] = (
+    "Title", "Department", "Description", "LeadSource",
+)
+
+# Lead SELECT: Rating/Industry/LeadSource/AnnualRevenue/Title vary by org/FLS.
+_LEAD_REQUIRED_FIELDS: Tuple[str, ...] = (
+    "Id", "FirstName", "LastName", "Email", "Phone", "Company", "Status",
+    "CreatedDate", "LastModifiedDate", "ConvertedDate", "ConvertedContactId",
+)
+_LEAD_OPTIONAL_FIELDS: Tuple[str, ...] = (
+    "Title", "Rating", "Industry", "LeadSource", "AnnualRevenue",
+)
+
+# Opportunity SELECT: ExpectedRevenue/Description/Type/Probability/Amount are often
+# FLS-hidden or absent depending on edition and profile.
+_OPPORTUNITY_REQUIRED_FIELDS: Tuple[str, ...] = (
+    "Id", "Name", "AccountId", "Account.Name", "StageName", "CloseDate",
+    "OwnerId", "Owner.Name", "IsWon", "IsClosed", "CreatedDate", "LastModifiedDate",
+)
+_OPPORTUNITY_OPTIONAL_FIELDS: Tuple[str, ...] = (
+    "Amount", "ExpectedRevenue", "Probability", "Type", "Description",
+)
 
 # Permission hierarchy for comparing and upgrading permissions
 # Higher number = higher permission level
@@ -601,11 +756,11 @@ def _accumulate_latest_feed_epoch(
     feed_records: List[SalesforceFeedRecord],
     latest_feed_epoch: Dict[str, int],
 ) -> None:
-    """Fold a page of `(ParentId, SystemModstamp or CreatedDate)` rows into the running
+    """Fold a page of `(ParentId, CreatedDate)` rows into the running
     parent-id -> latest-epoch-ms map (per-parent max wins)."""
     for f in feed_records:
         parent_id = f.ParentId
-        created_date = f.SystemModstamp or f.CreatedDate
+        created_date = f.CreatedDate
         if not parent_id or not created_date:
             continue
         epoch = _parse_salesforce_timestamp(created_date)
@@ -732,9 +887,9 @@ def _date_bound_conditions(
     """
     conditions: List[str] = []
     if after_ms:
-        conditions.append(f"{column} >= {to_soql_datetime(after_ms)}")
+        conditions.append(f"{column} >= {epoch_ms_to_iso(after_ms)}")
     if before_ms:
-        conditions.append(f"{column} <= {to_soql_datetime(before_ms)}")
+        conditions.append(f"{column} <= {epoch_ms_to_iso(before_ms)}")
     return conditions
 
 
@@ -835,36 +990,9 @@ class SalesforceConnector(BaseConnector):
         """EE override: injects org_id for tenant isolation on Person nodes."""
         return Person(**kwargs)
 
-    async def _own_external_orgs(self, tx_store: TransactionStore, nodes: list[dict]) -> list[dict]:
-        """The account organisations among ``nodes`` this connector's org may
-        reuse by name, in order: those recording it as parentOrgId
-        (`_create_org`), and ones written before that was recorded which the
-        org reaches through its own prospect or customer edge (the next upsert
-        stamps them). An unstamped node none of its edges reaches may be
-        another org's, so it is never reused. A failed edge read raises: read
-        as "no edges", it would duplicate every unstamped account."""
-        org_id = self.data_entities_processor.org_id
-        nodes = [n for n in nodes if n.get("isExternal") is True and n.get("parentOrgId") in (None, org_id)]
-        if not any(n.get("parentOrgId") is None for n in nodes):
-            return nodes
-        owned = await self._account_org_owners(tx_store)
-        return [n for n in nodes if n.get("parentOrgId") is not None or (n.get("_key") or n.get("id")) in owned]
-
-    async def _account_org_owners(self, tx_store: TransactionStore) -> dict[str, set[str | None]]:
-        """The organisations this org's own prospect or customer edges reach, each
-        with the Salesforce account ids those edges record."""
-        owner = f"{CollectionNames.ORGS.value}/{self.data_entities_processor.org_id}"
-        owners: dict[str, set[str | None]] = {}
-        for collection in (CollectionNames.PROSPECT.value, CollectionNames.CUSTOMER.value):
-            for edge in await tx_store.get_edges_from_node(owner, collection, raise_on_error=True):
-                key = str(edge.get("_to") or "").split("/", 1)[-1]
-                owners.setdefault(key, set()).add(edge.get("externalId"))
-        return owners
-
     def _create_org(self, **kwargs) -> Org:
-        """An account's external organisation, recording the org it belongs to
-        as parentOrgId, which scopes the organisation entity to that org."""
-        return Org(**{"parent_org_id": self.data_entities_processor.org_id, **kwargs})
+        """EE override: injects org_id as parentOrgId for tenant isolation on external Org nodes."""
+        return Org(**kwargs)
 
     def __init__(
         self,
@@ -889,6 +1017,10 @@ class SalesforceConnector(BaseConnector):
 
         self.connector_name = Connectors.SALESFORCE
         self.connector_id = connector_id
+        # Optional Account fields actually sampled in the most recent query. Set by
+        # the full-sync path; stays empty on incremental-only runs, so `duns_id` is
+        # simply omitted rather than written as None.
+        self._account_optional_fields: List[str] = []
 
         # Sync point for incremental user sync (time-based)
         self.user_sync_point = SyncPoint(
@@ -912,16 +1044,6 @@ class SalesforceConnector(BaseConnector):
         self.sync_filters: FilterCollection = FilterCollection()
         self.indexing_filters: FilterCollection = FilterCollection()
 
-        # On a full sync, the ids of the deals, cases, products and tasks this run wrote:
-        # their tasks and files are kept, and nothing hangs under a parent the run left
-        # out (the stored graph still links it until the run ends). None on incremental runs.
-        self._full_run_parents: Optional[set[str]] = None
-        self._moved_parents: set[str] = set()
-        # What this sync could not do (reported when it ends), and whether it read everything
-        # it was asked to (a full sync that skipped a record must not unlink it).
-        self._problems = SyncProblems()
-        self._read_everything = True
-
         # Shared HTTP client; created in init(), closed in cleanup().
         # Re-using a single client avoids per-call TCP connection overhead.
         self._http_client: Optional[httpx.AsyncClient] = None
@@ -937,6 +1059,155 @@ class SalesforceConnector(BaseConnector):
         except Exception:
             pass
         return self.api_version
+
+    @staticmethod
+    def _soql_failure_message(response: Any) -> str:
+        """Build a user-facing message from a failed Salesforce response.
+
+        `error` holds only the HTTP status ("HTTP 400"); the actionable text lives
+        in `message` (the response body). Both are included so the reason is
+        visible on the connector status rather than a bare status code.
+        """
+        error = getattr(response, "error", None) or "unknown error"
+        body = getattr(response, "message", None)
+        if body:
+            return f"SOQL query failed: {error} - {body}"
+        return f"SOQL query failed: {error}"
+
+    def _log_soql_failure(self, query_label: str, response: Any) -> None:
+        """Log a failed SOQL call including the Salesforce error body.
+
+        Without the body it is impossible to distinguish an invalid field from a
+        malformed query from a permissions failure -- all three arrive as HTTP 400.
+        """
+        self.logger.error(
+            "SOQL query failed: status=%s error=%s salesforceError=%s Query: %s",
+            getattr(response, "status_code", None),
+            getattr(response, "error", None),
+            getattr(response, "message", None),
+            query_label,
+        )
+
+    async def _resolve_optional_sobject_fields(
+        self,
+        api_version: str,
+        sobject: str,
+        preferred_fields: Tuple[str, ...],
+    ) -> List[str]:
+        """Return the preferred optional fields this org actually serves for *sobject*.
+
+        Naming an unavailable field makes Salesforce reject the *entire* SOQL
+        statement, which used to abort the whole sync. The describe call is the
+        authoritative source; at most one describe call per (sobject, sync run).
+        """
+        if not self.data_source or not preferred_fields:
+            return []
+
+        try:
+            response = await self.data_source.sobject_describe(
+                api_version=api_version, sobject=sobject,
+            )
+        except Exception as exc:  # noqa: BLE001 - discovery is best-effort
+            self.logger.warning(
+                "Could not describe the %s object (%s); querying only the "
+                "always-available %s fields.",
+                sobject, exc, sobject,
+            )
+            return []
+
+        available = {
+            field.get("name")
+            for field in ((response.data or {}).get("fields") or [])
+            if isinstance(field, dict)
+        }
+
+        if not response.success or not available:
+            self.logger.warning(
+                "%s describe returned no usable field list (status=%s error=%s); "
+                "querying only the always-available %s fields.",
+                sobject, response.status_code, response.error, sobject,
+            )
+            return []
+
+        # Selectability, not mere membership, is what SOQL requires.
+        selectable = available - {
+            field.get("name")
+            for field in ((response.data or {}).get("fields") or [])
+            if isinstance(field, dict) and field.get("selectable") is False
+        }
+
+        # A relationship field is queried as "Owner.Name" / "Account.Name" but
+        # described as "OwnerId" / "AccountId".
+        def _is_selectable(field: str) -> bool:
+            base = field.split(".")[0]
+            if base != field:
+                return f"{base}Id" in selectable
+            return field in selectable
+
+        resolved = [field for field in preferred_fields if _is_selectable(field)]
+        skipped = [field for field in preferred_fields if field not in resolved]
+        if skipped:
+            self.logger.info(
+                "Salesforce org does not expose optional %s field(s) %s; "
+                "excluding them from the query.",
+                sobject, ", ".join(skipped),
+            )
+        return resolved
+
+    async def _resolve_optional_account_fields(self, api_version: str) -> List[str]:
+        """Return the preferred optional Account fields this org actually serves."""
+        return await self._resolve_optional_sobject_fields(
+            api_version, "Account", _ACCOUNT_OPTIONAL_FIELDS,
+        )
+
+    async def _resolve_optional_contact_fields(self, api_version: str) -> List[str]:
+        """Return the preferred optional Contact fields this org actually serves."""
+        return await self._resolve_optional_sobject_fields(
+            api_version, "Contact", _CONTACT_OPTIONAL_FIELDS,
+        )
+
+    async def _resolve_optional_lead_fields(self, api_version: str) -> List[str]:
+        """Return the preferred optional Lead fields this org actually serves."""
+        return await self._resolve_optional_sobject_fields(
+            api_version, "Lead", _LEAD_OPTIONAL_FIELDS,
+        )
+
+    async def _resolve_optional_opportunity_fields(self, api_version: str) -> List[str]:
+        """Return the preferred optional Opportunity fields this org actually serves."""
+        return await self._resolve_optional_sobject_fields(
+            api_version, "Opportunity", _OPPORTUNITY_OPTIONAL_FIELDS,
+        )
+
+    def _build_accounts_soql(self, optional_fields: List[str]) -> str:
+        """Compose the Account SELECT for a full sync.
+
+        The Opportunities subquery is left in: it is a parent-to-child relationship
+        subquery, where ORDER BY is supported, and its result feeds _parse_opportunities
+        (end date + active-customer flag). It is not filtered through the describe
+        result -- a rejected subquery surfaces as a clear error rather than
+        silently dropping deal data.
+        """
+        fields = ", ".join([*_ACCOUNT_REQUIRED_FIELDS, *optional_fields])
+        return (
+            f"SELECT {fields}, "
+            "(SELECT Id, CloseDate, IsWon, IsClosed FROM Opportunities ORDER BY CloseDate ASC) "
+            "FROM Account"
+        )
+
+    def _build_contacts_soql(self, optional_fields: List[str]) -> str:
+        """Compose the Contact SELECT for sync."""
+        fields = ", ".join([*_CONTACT_REQUIRED_FIELDS, *optional_fields])
+        return f"SELECT {fields} FROM Contact"
+
+    def _build_leads_soql(self, optional_fields: List[str]) -> str:
+        """Compose the Lead SELECT for sync."""
+        fields = ", ".join([*_LEAD_REQUIRED_FIELDS, *optional_fields])
+        return f"SELECT {fields} FROM Lead"
+
+    def _build_opportunities_soql(self, optional_fields: List[str]) -> str:
+        """Compose the Opportunity SELECT for sync."""
+        fields = ", ".join([*_OPPORTUNITY_REQUIRED_FIELDS, *optional_fields])
+        return f"SELECT {fields} FROM Opportunity"
 
     async def _soql_query_paginated(
         self,
@@ -964,7 +1235,18 @@ class SalesforceConnector(BaseConnector):
             response = await self.data_source.soql_query(api_version=api_version, q=q)
 
         if not response.success:
-            self._raise_failed_request(response, "SOQL query", q[:300])
+            # Salesforce puts the actionable detail (INVALID_FIELD,
+            # MALFORMED_QUERY, ...) in the response body, which the data source
+            # surfaces as `message`; `error` only carries the HTTP status. Log
+            # both, otherwise every failure reads as an unexplained "HTTP 400".
+            self._log_soql_failure(q, response)
+            raise_for_stream_fetch(
+                success=False,
+                has_payload=False,
+                connector=self.display_name,
+                status=response.status_code,
+                message=self._soql_failure_message(response),
+            )
 
         yield list(response.data.get("records") or [])
 
@@ -974,55 +1256,15 @@ class SalesforceConnector(BaseConnector):
                 break
             response = await self.data_source.soql_query_next(next_url=next_url)
             if not response.success:
-                self._raise_failed_request(response, "SOQL pagination", next_url)
+                self._log_soql_failure(f"nextRecordsUrl={next_url}", response)
+                raise_for_stream_fetch(
+                    success=False,
+                    has_payload=False,
+                    connector=self.display_name,
+                    status=response.status_code,
+                    message=f"SOQL pagination failed: {response.error}",
+                )
             yield list(response.data.get("records") or [])
-
-    def _raise_failed_request(self, response: SalesforceResponse, what: str, where: str) -> None:
-        """Log what Salesforce answered, then raise the stream error for its status from the
-        answer itself, so a sync can still tell the API limit from a missing permission.
-
-        Salesforce reports a spent allowance as REQUEST_LIMIT_EXCEEDED: 403 for the org's daily
-        API requests, 503 for Chatter's per-user hourly limit. Both are a rate limit (429), so
-        the indexer waits and reads again instead of treating it as a missing permission or an
-        outage."""
-        status = getattr(response, "status_code", None)
-        answer = SalesforceRequestFailed(status, getattr(response, "message", None) or getattr(response, "error", None))
-        retry_after = None
-        if answer.error_code == "REQUEST_LIMIT_EXCEEDED":
-            if status == HttpStatusCode.SERVICE_UNAVAILABLE.value:
-                retry_after = 3600  # Chatter's limit is per hour
-            status = HttpStatusCode.TOO_MANY_REQUESTS.value
-            self.logger.warning("%s refused, Salesforce request limit reached (%s): %s", what, where, answer)
-        else:
-            self.logger.error("%s failed (%s): %s", what, where, answer)
-        try:
-            raise_for_stream_fetch(
-                success=False,
-                has_payload=False,
-                connector=self.display_name,
-                status=status,
-                message=f"{what} failed: {getattr(response, 'error', '')}",
-                retry_after=retry_after,
-            )
-        except Exception as mapped:
-            raise mapped from answer
-
-    async def _complete_child_list(self, child: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
-        """A nested (parent-to-child) query result with every row: Salesforce returns a long
-        child list with ``done: false`` and its own ``nextRecordsUrl``. A page that fails raises."""
-        if not isinstance(child, dict) or child.get("done", True) or not child.get("nextRecordsUrl"):
-            return child
-        if not self.data_source:
-            raise connector_not_ready(self.display_name)
-        records = list(child.get("records") or [])
-        next_url = child.get("nextRecordsUrl")
-        while next_url:
-            response = await self.data_source.soql_query_next(next_url=next_url)
-            if not response.success or not isinstance(response.data, dict):
-                self._raise_failed_request(response, "Nested SOQL page", next_url)
-            records.extend(response.data.get("records") or [])
-            next_url = None if response.data.get("done", True) else response.data.get("nextRecordsUrl")
-        return {**child, "records": records, "done": True, "nextRecordsUrl": None}
 
     @staticmethod
     async def _typed_pages(
@@ -1077,38 +1319,6 @@ class SalesforceConnector(BaseConnector):
             ]
             if kept:
                 yield kept
-
-    def _in_run_scope(self, parent_ids: set[str]) -> set[str]:
-        """The parents a child may hang under this run (see ``_full_run_parents``)."""
-        if self._full_run_parents is None:
-            return parent_ids
-        return {p for p in parent_ids if p in self._full_run_parents}
-
-    def _note_written(self, records: list[Record]) -> None:
-        if self._full_run_parents is not None:
-            self._full_run_parents.update(r.external_record_id for r in records if r.external_record_id)
-
-    def _note_moves(self, stored_by_ext: dict[str, dict[str, Any]], records: list[Record]) -> None:
-        """Remember the records whose group changed: their files are filed under them."""
-        for record in records:
-            stored = stored_by_ext.get(record.external_record_id)
-            if stored and stored.get("externalGroupId") != record.external_record_group_id:
-                self._moved_parents.add(record.external_record_id)
-
-    def _unchanged(self, stored: Optional[dict[str, Any]], record: Record) -> bool:
-        """A record re-read inside the checkpoint overlap that Salesforce did not change.
-
-        Only on incremental runs: a full sync must write every record it reads, or the
-        platform unlinks it as unseen once the sync ends."""
-        if self._full_run_parents is not None or not stored or not record.external_revision_id:
-            return False
-        return (
-            stored.get("externalRevisionId") == record.external_revision_id
-            and stored.get("externalGroupId") == record.external_record_group_id
-            and stored.get("recordName") == record.record_name
-            and stored.get("externalParentId") == record.parent_external_record_id
-            and not stored.get("isDeleted")
-        )
 
     async def init(self) -> bool:
         """
@@ -1209,7 +1419,7 @@ class SalesforceConnector(BaseConnector):
             True if no reinit was needed (API succeeded) or reinit succeeded;
             False if data source is not initialized, or 401 was received but refresh failed.
         """
-        self.logger.debug("Checking the Salesforce access token")
+        self.logger.info("Reinitializing Salesforce token if needed...")
 
         if not self.data_source:
             self.logger.warning("Salesforce data source not initialized; cannot reinitialize token.")
@@ -1404,88 +1614,8 @@ class SalesforceConnector(BaseConnector):
 
         return "".join(html_parts)
 
-    async def _get_next_page(self, next_url: str, pages_seen: set[str], parent_id: str) -> SalesforceResponse:
-        """GET a Connect API ``nextPageUrl``. Its page token is in the query string, which the
-        HTTP client drops unless it is passed as params; a URL that comes back a second time
-        would page forever, so it fails the read instead."""
-        if next_url in pages_seen:
-            raise_for_stream_fetch(
-                success=False,
-                has_payload=False,
-                connector=self.display_name,
-                status=None,
-                message=f"Chatter paging for {parent_id} returned a page it had already returned",
-            )
-        pages_seen.add(next_url)
-        split = urlsplit(next_url)
-        return await self.data_source._execute_request(
-            method="GET",
-            path=split.path,
-            params=dict(parse_qsl(split.query, keep_blank_values=True)) or None,
-            body=None,
-            content_type="application/json",
-        )
-
-    def _raise_feed_error(self, resp: SalesforceResponse, parent_id: str) -> None:
-        self._raise_failed_request(resp, "Chatter feed read", parent_id)
-
-    def _raise_unless_no_feed(self, resp: SalesforceResponse, parent_id: str) -> None:
-        """A record whose object has no feed answers 400 or 404, and an org without Chatter
-        answers 403: it has no discussion. Anything else (a 5xx, the API limit, which is also
-        a 403, a dropped connection) fails the read."""
-        status = getattr(resp, "status_code", None)
-        detail = f"{getattr(resp, 'message', '') or ''} {getattr(resp, 'error', '') or ''}"
-        feature_off = status == HttpStatusCode.FORBIDDEN.value and "REQUEST_LIMIT_EXCEEDED" not in detail
-        if status in (HttpStatusCode.BAD_REQUEST.value, HttpStatusCode.NOT_FOUND.value) or feature_off:
-            self.logger.debug("No Chatter feed for %s (%s)", parent_id, status)
-            return
-        self._raise_feed_error(resp, parent_id)
-
-    async def _complete_comment_pages(self, element: "ChatterElement", parent_id: str) -> None:
-        """Read the comments Salesforce left out of a feed element, oldest pages last."""
-        caps = element.capabilities or {}
-        page = (caps.get("comments") or {}).get("page") or {}
-        next_url = page.get("nextPageUrl")
-        if not next_url:
-            return
-        items = list(page.get("items") or [])
-        seen = {c.get("id") for c in items if isinstance(c, dict)}
-        pages_seen: set[str] = set()
-        while next_url:
-            more = await self._get_next_page(next_url, pages_seen, parent_id)
-            if not more.success or not isinstance(more.data, dict):
-                self._raise_feed_error(more, parent_id)
-            for c in more.data.get("items") or []:
-                if isinstance(c, dict) and c.get("id") not in seen:
-                    seen.add(c.get("id"))
-                    items.append(c)
-            next_url = more.data.get("nextPageUrl")
-        items.sort(key=lambda c: (c.get("createdDate") or "", c.get("id") or ""))
-        page["items"] = items
-        page["nextPageUrl"] = None
-
     # Inline images larger than this are skipped to protect heap memory.
     _MAX_INLINE_IMAGE_BYTES: int = 10 * 1024 * 1024  # 10 MB
-
-    async def _get_capped(
-        self, http_client: httpx.AsyncClient, url: str, headers: dict[str, str],
-    ) -> tuple[Optional[bytes], int, httpx.Headers]:
-        """GET ``url``, reading at most _MAX_INLINE_IMAGE_BYTES (body None when larger)."""
-        limit = self._MAX_INLINE_IMAGE_BYTES
-        async with http_client.stream("GET", url, headers=headers, follow_redirects=True) as response:
-            if response.status_code != 200:
-                return b"", response.status_code, response.headers
-            declared = response.headers.get("Content-Length")
-            if declared and declared.isdigit() and int(declared) > limit:
-                return None, response.status_code, response.headers
-            chunks: list[bytes] = []
-            total = 0
-            async for chunk in response.aiter_bytes(STREAM_CHUNK_SIZE):
-                total += len(chunk)
-                if total > limit:
-                    return None, response.status_code, response.headers
-                chunks.append(chunk)
-            return b"".join(chunks), response.status_code, response.headers
 
     async def _fetch_file_as_base64_uri(self, full_url: str) -> Optional[str]:
         """
@@ -1510,24 +1640,31 @@ class SalesforceConnector(BaseConnector):
                 headers["Authorization"] = f"Bearer {access_token}"
 
             http_client = self._http_client or guarded_async_client()
-            raw, status, response_headers = await self._get_capped(http_client, full_url, headers)
+            response = await http_client.get(full_url, headers=headers, follow_redirects=True)
 
             # If public fetch 404s, retry once with an auth token
-            if status == 404 and is_public_asset:
+            if response.status_code == 404 and is_public_asset:
                 access_token = await self._get_access_token()
                 if not access_token:
                     return None
-                raw, status, response_headers = await self._get_capped(
-                    http_client, full_url, {"Authorization": f"Bearer {access_token}"},
+                response = await http_client.get(
+                    full_url,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    follow_redirects=True,
                 )
 
-            if status != 200:
-                return None
-            if raw is None:
-                self.logger.warning("Skipping oversized inline image: %s", full_url)
+            if response.status_code != 200:
                 return None
 
-            content_type = response_headers.get("Content-Type", "")
+            cl = response.headers.get("Content-Length")
+            if cl and int(cl) > self._MAX_INLINE_IMAGE_BYTES:
+                self.logger.warning(
+                    "Skipping oversized inline image (%s bytes): %s", cl, full_url
+                )
+                return None
+
+            raw = response.content
+            content_type = response.headers.get("Content-Type", "")
 
             # Determine mime type: prefer Content-Type header, fallback to magic bytes
             if "image/jpeg" in content_type or "image/jpg" in content_type:
@@ -1576,10 +1713,7 @@ class SalesforceConnector(BaseConnector):
             record_group_id=parent_id,
             version=api_version,
         )
-        if resp.success and not resp.data:
-            return []
-        if not resp.success:
-            self._raise_unless_no_feed(resp, parent_id)
+        if not resp.success or not resp.data:
             return []
 
         all_elements.extend(
@@ -1587,22 +1721,20 @@ class SalesforceConnector(BaseConnector):
         )
 
         next_page_url = resp.data.get("nextPageUrl")
-        pages_seen: set[str] = set()
         while next_page_url:
-            paged_resp = await self._get_next_page(next_page_url, pages_seen, parent_id)
+            paged_resp = await self.data_source._execute_request(
+                method="GET",
+                path=next_page_url,
+                params=None,
+                body=None,
+                content_type="application/json",
+            )
             if not paged_resp.success or not paged_resp.data:
-                # A page that did not come back is not the end of the feed: indexing what
-                # was read so far would store the record as complete without it.
-                self._raise_feed_error(paged_resp, parent_id)
+                break
             all_elements.extend(
                 [ChatterElement.model_validate(e) for e in (paged_resp.data.get("elements") or [])]
             )
             next_page_url = paged_resp.data.get("nextPageUrl")
-
-        # Salesforce embeds only the latest comments of each post (3 by default); the rest
-        # are read page by page from capabilities.comments.page.nextPageUrl.
-        for element in all_elements:
-            await self._complete_comment_pages(element, parent_id)
 
         # --- Helpers ---
 
@@ -1710,13 +1842,13 @@ class SalesforceConnector(BaseConnector):
             if segments and is_rich:
                 # Build HTML from segments (images become base64 data URIs)
                 html = await self._message_segments_to_html(segments)
-                return await html_to_markdown_async(html) if html else ""
+                return html_to_markdown(html) if html else ""
             else:
                 # Plain text fallback
                 plain = (body.text or "").strip()
                 if plain:
                     converted = await self._process_html_images(plain)
-                    return await html_to_markdown_async(converted) if converted else ""
+                    return html_to_markdown(converted) if converted else ""
                 return ""
 
         def _prepend_ts(data: str, ts: Optional[str]) -> str:
@@ -2045,26 +2177,6 @@ class SalesforceConnector(BaseConnector):
                     block_group_indices=sorted(blockgroup_children_map[bg.index])
                 )
     
-    # Hosts Salesforce serves an org's files from, besides the org's own instance URL.
-    _SALESFORCE_FILE_HOST_SUFFIXES: tuple[str, ...] = (
-        ".force.com", ".salesforce.com", ".documentforce.com", ".salesforce-sites.com",
-    )
-
-    def _is_salesforce_file_url(self, src: str) -> bool:
-        """A public file asset served by Salesforce. Whoever writes an email or a record
-        chooses these URLs (an Email-to-Case body comes from outside the company), so a
-        URL on any other host is left as it is and never fetched."""
-        try:
-            parsed = urlsplit(src)
-        except ValueError:
-            return False
-        host = (parsed.hostname or "").lower()
-        instance_host = (urlsplit(self.salesforce_instance_url or "").hostname or "").lower()
-        on_salesforce = bool(host) and (
-            host == instance_host or host.endswith(self._SALESFORCE_FILE_HOST_SUFFIXES)
-        )
-        return on_salesforce and bool(re.search(r"/file-asset-public/[^?]+", parsed.path))
-
     async def _process_html_images(self, html_content: str) -> str:
         """Embed Salesforce public-asset images as inline base64 data URIs."""
         # Whoever writes the record chooses these URLs, so they may only reach public addresses.
@@ -2073,8 +2185,8 @@ class SalesforceConnector(BaseConnector):
                 html_content,
                 http_client,
                 self.logger,
-                url_filter=self._is_salesforce_file_url,
-                max_bytes=self._MAX_INLINE_IMAGE_BYTES,
+                # Only inline images hosted on Salesforce public file-asset URLs.
+                url_filter=lambda src: bool(re.search(r"/file-asset-public/[^?]+", src)),
             )
 
     async def stream_record(self, record: Record, user_id: Optional[str] = None, convertTo: Optional[str] = None) -> StreamingResponse:
@@ -2084,7 +2196,7 @@ class SalesforceConnector(BaseConnector):
         For FILE records: streams file bytes from Salesforce ContentVersion (like Dropbox),
         using create_stream_record_response with filename and mime_type.
 
-        For PRODUCT, DEAL, CASE, TASK: streams BlocksContainer JSON.
+        For PRODUCT, DEAL, CASE, TASK, OTHERS (custom objects): streams BlocksContainer JSON.
         """
 
         await self._reinitialize_token_if_needed()
@@ -2108,6 +2220,12 @@ class SalesforceConnector(BaseConnector):
                 content_bytes = await self._process_case_record(record)
             elif record.record_type == RecordType.TASK:
                 content_bytes = await self._process_task_record(record)
+            elif record.record_type in (RecordType.OTHERS, RecordType.WEBPAGE) and (
+                (record.external_record_group_id or "").startswith(_CUSTOM_OBJECT_GROUP_PREFIX)
+            ):
+                content_bytes = await self._process_custom_object_record(record)
+            elif record.record_type == RecordType.OTHERS:
+                content_bytes = await self._process_custom_object_record(record)
             else:
                 raise HTTPException(
                     status_code=HttpStatusCode.BAD_REQUEST.value,
@@ -2368,7 +2486,7 @@ class SalesforceConnector(BaseConnector):
             f"SELECT Id, Subject, Description FROM Task WHERE Id = '{safe_task_id}'"
         )
         email_query = (
-            f"SELECT Id, Subject, HtmlBody, TextBody, HasAttachment, FromAddress, ToAddress "
+            f"SELECT Id, Subject, HtmlBody, TextBody, HasAttachment "
             f"FROM EmailMessage WHERE ActivityId = '{safe_task_id}' LIMIT 1"
         )
         task_data, email_data = await asyncio.gather(
@@ -2442,7 +2560,7 @@ class SalesforceConnector(BaseConnector):
             if html_body:
                 # Convert images to base64 and then to Markdown
                 processed_html = await self._process_html_images(html_body)
-                body_md = await html_to_markdown_async(processed_html)
+                body_md = html_to_markdown(processed_html)
             else:
                 # Fallback to TextBody if HtmlBody is missing
                 body_md = email_data.get("TextBody") or "No body content available."
@@ -2486,12 +2604,6 @@ class SalesforceConnector(BaseConnector):
 
 # --------------- Data Sync Methods ---------------
 
-    # Salesforce takes at most 5 query subrequests in one composite call (of its 25), and
-    # at most 200 RecordIds in one UserRecordAccess query (REST API, Composite; Object
-    # Reference, UserRecordAccess).
-    URA_IDS_PER_QUERY = 200
-    QUERIES_PER_COMPOSITE = 5
-
     async def _iter_record_access(
         self,
         user_id: str,
@@ -2502,11 +2614,11 @@ class SalesforceConnector(BaseConnector):
     ) -> AsyncGenerator[tuple[str, str, str], None]:
         """
         Yields (record_id, user_email, access_level) tuples for a given user,
-        streaming results as each composite batch resolves. A query that failed
+        streaming results as each composite batch resolves. A batch that failed
         adds the user's email to ``incomplete``: what was yielded is then not the
         user's full access.
         """
-        unique_ids = list(dict.fromkeys(rid for rid in record_ids if rid))
+        unique_ids = list(set(rid for rid in record_ids if rid))
         if not unique_ids or not user_id:
             return
 
@@ -2518,14 +2630,15 @@ class SalesforceConnector(BaseConnector):
                 incomplete.add(user_email)
             return
 
+        SOQL_BATCH_SIZE = 200
+        COMPOSITE_BATCH_SIZE = 25
+
         base_query_url = f"/services/data/v{api_version}/query/"
 
-        sub_requests: list[dict[str, Any]] = []
-        batch_ids: dict[str, list[str]] = {}
-        for i in range(0, len(unique_ids), self.URA_IDS_PER_QUERY):
-            safe_ids = _sanitize_soql_ids_batch(
-                unique_ids[i : i + self.URA_IDS_PER_QUERY], self.logger, "access check",
-            )
+        sub_requests = []
+        for i in range(0, len(unique_ids), SOQL_BATCH_SIZE):
+            batch_ids = unique_ids[i : i + SOQL_BATCH_SIZE]
+            safe_ids = _sanitize_soql_ids_batch(batch_ids, self.logger, "access check")
             if not safe_ids:
                 continue
             ids_str = "','".join(safe_ids)
@@ -2534,17 +2647,14 @@ class SalesforceConnector(BaseConnector):
                 f"WHERE UserId='{safe_user_id}' "
                 f"AND RecordId IN ('{ids_str}')"
             )
-            reference = f"access_batch_{i}"
-            batch_ids[reference] = safe_ids
             sub_requests.append({
                 "method": "GET",
                 "url": f"{base_query_url}?q={quote(query)}",
-                "referenceId": reference,
+                "referenceId": f"access_batch_{i}"
             })
 
-        for i in range(0, len(sub_requests), self.QUERIES_PER_COMPOSITE):
-            batch = sub_requests[i : i + self.QUERIES_PER_COMPOSITE]
-            answered: set = set()
+        for i in range(0, len(sub_requests), COMPOSITE_BATCH_SIZE):
+            batch = sub_requests[i : i + COMPOSITE_BATCH_SIZE]
             try:
                 response = await self.data_source.composite(
                     version=api_version,
@@ -2552,37 +2662,38 @@ class SalesforceConnector(BaseConnector):
                 )
                 if not response.success or not response.data:
                     self.logger.error(f"Composite access check failed: {response.error}")
-                else:
-                    for item in response.data.get("compositeResponse") or []:
-                        reference = item.get("referenceId")
-                        body = item.get("body")
-                        if item.get("httpStatusCode") != 200 or not isinstance(body, dict):
-                            continue
-                        if not body.get("done", True):
-                            # 200 ids fit on one page; anything else is not the whole answer.
-                            continue
-                        answered.add(reference)
-                        for row in body.get("records") or []:
-                            rec_id = row.get("RecordId")
-                            max_access = row.get("MaxAccessLevel")
+                    if incomplete is not None:
+                        incomplete.add(user_email)
+                    continue
 
-                            if max_access in ("All", "Transfer"):
-                                access_level = "OWNER"
-                            elif max_access in ("Edit", "Delete"):
-                                access_level = "WRITER"
-                            elif max_access == "Read":
-                                access_level = "READER"
-                            else:
-                                continue  # Skip OTHERS entirely — no yield, no DB write
+                for item in response.data.get("compositeResponse") or []:
+                    if item.get("httpStatusCode") != 200:
+                        if incomplete is not None:
+                            incomplete.add(user_email)
+                        continue
 
-                            yield rec_id, user_email, access_level
+                    for row in (item.get("body") or {}).get("records") or []:
+                        rec_id = row.get("RecordId")
+                        max_access = row.get("MaxAccessLevel")
+
+                        if max_access in ("All", "Transfer"):
+                            access_level = "OWNER"
+                        elif max_access in ("Edit", "Delete"):
+                            access_level = "WRITER"
+                        elif max_access == "Read":
+                            access_level = "READER"
+                        else:
+                            continue  # Skip OTHERS entirely — no yield, no DB write
+
+                        yield rec_id, user_email, access_level
+
             except Exception as e:
                 self.logger.error(
                     f"Error processing access batch {i} for user {user_email}: {e}",
                     exc_info=True
                 )
-            if incomplete is not None and any(sub["referenceId"] not in answered for sub in batch):
-                incomplete.add(user_email)
+                if incomplete is not None:
+                    incomplete.add(user_email)
 
     async def _authenticated_user_id(self) -> Optional[str]:
         """The user id that ends the identity URL Salesforce returns with every token."""
@@ -2613,70 +2724,277 @@ class SalesforceConnector(BaseConnector):
         user = user or {}
         await self.register_authenticated_source_user(user.get("Email"), user.get("Id"))
 
-    async def run_sync(self) -> None:
-        """One sync (see _run_sync). A sync that stops tells the connector's creator and the
-        org admins why, then raises; one that finished with problems sends one warning."""
-        self._problems = SyncProblems()
-        self._read_everything = True
-        try:
-            await self._run_sync()
-        except Exception as e:
-            await self._notify(stopped_sync_notice(e))
-            raise
-        notice = self._problems.notice()
-        if notice is not None:
-            await self._notify(notice)
 
-    async def _notify(self, notice: Notice) -> None:
-        """A notice about this connector instance, to its creator and the org admins. The
-        platform backs off repeats. Never raises: it reports a failure, it must not hide one."""
-        try:
-            outcome = await self.notify_and_wait(
-                type=notice.type,
-                severity=notice.severity,
-                title=self._notification_title(notice.event),
-                message=notice.message,
-                recipient_user_ids=[self.created_by] if self.created_by else None,
-                recipient_roles=[NotificationRecipientRole.ADMIN],
+    async def _list_custom_sobjects(self, api_version: str) -> List[Dict[str, Any]]:
+        """Discover syncable custom Salesforce objects via describe-global."""
+        if not self.data_source:
+            raise connector_not_ready(self.display_name)
+        response = await self.data_source.sobject_describe_global(api_version=api_version)
+        if not response.success:
+            self.logger.error(
+                "sobject_describe_global failed: status=%s error=%s",
+                response.status_code, response.error,
             )
-            if outcome == NotificationOutcome.FAILED:
-                self.logger.warning('The notice "%s" was not sent', notice.event)
+            raise_for_stream_fetch(
+                success=False,
+                has_payload=False,
+                connector=self.display_name,
+                status=response.status_code,
+                message=self._soql_failure_message(response),
+            )
+        sobjects = list((response.data or {}).get("sobjects") or [])
+        selected = [m for m in sobjects if _is_syncable_custom_sobject(m)]
+        selected.sort(key=lambda m: (m.get("label") or m.get("name") or ""))
+        self.logger.info(
+            "Discovered %d syncable custom Salesforce objects (of %d total sobjects)",
+            len(selected), len(sobjects),
+        )
+        return selected
+
+    async def _describe_custom_sobject_fields(
+        self, api_version: str, api_name: str,
+    ) -> List[Dict[str, Any]]:
+        response = await self.data_source.sobject_describe(api_version=api_version, sobject=api_name)
+        if not response.success:
+            self.logger.warning(
+                "describe failed for %s: status=%s error=%s",
+                api_name, response.status_code, response.error,
+            )
+            return []
+        return list((response.data or {}).get("fields") or [])
+
+    def _build_custom_object_record(
+        self,
+        api_name: str,
+        label: str,
+        row: Dict[str, Any],
+        name_field: Optional[str],
+    ) -> Record:
+        record_id = row.get("Id")
+        record_name, _ = _format_custom_object_markdown(api_name, label, row, name_field)
+        weburl = None
+        if self.salesforce_instance_url and record_id:
+            try:
+                weburl = HttpUrl(f"{self.salesforce_instance_url}/{record_id}")
+            except Exception:
+                pass
+        revision = row.get("SystemModstamp") or row.get("LastModifiedDate")
+        # WebpageRecord implements to_kafka_record(); bare Record raises NotImplementedError
+        # during on_new_records indexing enqueue.
+        return WebpageRecord(
+            record_name=record_name[:500] if record_name else f"{api_name} {record_id}",
+            record_type=RecordType.WEBPAGE,
+            record_group_type=RecordGroupType.SALESFORCE_ORG,
+            external_record_id=record_id,
+            external_record_group_id=f"{_CUSTOM_OBJECT_GROUP_PREFIX}{api_name}",
+            external_revision_id=str(revision) if revision else None,
+            version=1,
+            origin=OriginTypes.CONNECTOR,
+            connector_name=self.connector_name,
+            connector_id=self.connector_id,
+            mime_type=MimeTypes.BLOCKS.value,
+            source_created_at=_parse_salesforce_timestamp(row.get("CreatedDate")),
+            source_updated_at=_parse_salesforce_timestamp(row.get("LastModifiedDate")),
+            inherit_permissions=False,
+            preview_renderable=False,
+            weburl=str(weburl) if weburl is not None else None,
+        )
+
+    async def _sync_one_custom_object(
+        self,
+        api_version: str,
+        meta: Dict[str, Any],
+    ) -> Tuple[int, int, int]:
+        """Sync one custom object. Returns (total, new, updated)."""
+        api_name = meta.get("name") or ""
+        label = meta.get("label") or api_name
+        if not api_name:
+            return 0, 0, 0
+
+        fields_meta = await self._describe_custom_sobject_fields(api_version, api_name)
+        if not fields_meta:
+            self.logger.warning("Skipping custom object %s: no describe fields", api_name)
+            return 0, 0, 0
+
+        select_fields = _select_custom_object_fields(fields_meta)
+        if "Id" not in select_fields:
+            self.logger.warning("Skipping custom object %s: no Id field", api_name)
+            return 0, 0, 0
+        name_field = _pick_custom_object_name_field(fields_meta)
+
+        org_permission = Permission(entity_type=EntityType.ORG, type=PermissionType.READ)
+        record_group = RecordGroup(
+            name=f"Salesforce · {label}",
+            external_group_id=f"{_CUSTOM_OBJECT_GROUP_PREFIX}{api_name}",
+            group_type=RecordGroupType.SALESFORCE_ORG,
+            connector_name=self.connector_name,
+            connector_id=self.connector_id,
+        )
+        await self.data_entities_processor.on_new_record_groups([(record_group, [org_permission])])
+
+        sync_key = f"{_CUSTOM_OBJECTS_SYNC_POINT_PREFIX}{api_name}"
+        sync_point = await self.records_sync_point.read_sync_point(sync_key)
+        last_ts_ms = sync_point.get("lastSyncTimestamp")
+
+        field_list = ", ".join(select_fields)
+        base_soql = f"SELECT {field_list} FROM {api_name}"
+        if last_ts_ms and any(f.get("name") == "LastModifiedDate" for f in fields_meta):
+            soql_datetime = epoch_ms_to_iso(last_ts_ms)
+            soql = f"{base_soql} WHERE LastModifiedDate >= {soql_datetime} ORDER BY LastModifiedDate ASC"
+        elif any(f.get("name") == "LastModifiedDate" for f in fields_meta):
+            soql = f"{base_soql} ORDER BY LastModifiedDate ASC"
+        else:
+            soql = f"{base_soql} ORDER BY Id ASC"
+
+        total = 0
+        total_new = 0
+        total_updated = 0
+        try:
+            async for page in self._soql_query_paginated(api_version=api_version, q=soql):
+                records: List[Record] = []
+                for row in page:
+                    try:
+                        if not row.get("Id"):
+                            continue
+                        record = self._build_custom_object_record(api_name, label, row, name_field)
+                        if self.indexing_filters and self.indexing_filters.is_enabled(
+                            IndexingFilterKey.ENABLE_MANUAL_SYNC,
+                        ):
+                            record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+                        records.append(record)
+                    except Exception as e:
+                        self.logger.warning(
+                            "Failed to process %s row %s: %s", api_name, row.get("Id"), e,
+                        )
+                        continue
+
+                if not records:
+                    continue
+
+                async with self.data_store_provider.transaction() as tx_store:
+                    existing_nodes = await tx_store.get_nodes_by_field_in(
+                        collection=CollectionNames.RECORDS.value,
+                        field="externalRecordId",
+                        values=[r.external_record_id for r in records if r.external_record_id],
+                    )
+                existing_ext_ids = {
+                    node.get("externalRecordId")
+                    for node in (existing_nodes or [])
+                    if node.get("externalRecordId") and node.get("connectorId") == self.connector_id
+                }
+                new_records = [r for r in records if r.external_record_id not in existing_ext_ids]
+                update_records = [r for r in records if r.external_record_id in existing_ext_ids]
+
+                if new_records:
+                    await self.data_entities_processor.on_new_records(
+                        [(r, []) for r in new_records],
+                    )
+                for record in update_records:
+                    await self.data_entities_processor.on_record_content_update(record)
+
+                total += len(records)
+                total_new += len(new_records)
+                total_updated += len(update_records)
+
+            await self.records_sync_point.update_sync_point(
+                sync_key,
+                {"lastSyncTimestamp": get_epoch_timestamp_in_ms()},
+            )
+            self.logger.info(
+                "Synced custom object %s (%s): %d rows (%d new, %d updated)",
+                api_name, label, total, total_new, total_updated,
+            )
+            return total, total_new, total_updated
         except Exception as e:
-            self.logger.error('Could not send the notice "%s": %s', notice.event, e)
+            self.logger.error("Error syncing custom object %s: %s", api_name, e, exc_info=True)
+            # Continue with other objects — one bad object must not abort the rest.
+            return total, total_new, total_updated
 
-    async def on_background_init_failed(self, error: Optional[Exception]) -> None:
-        """A scheduled sync could not start, where nobody sees why."""
-        await self._notify(Notice(
-            NotificationType.CONNECTOR_AUTH_ERROR, NotificationSeverity.ERROR, "could not start",
-            "PipesHub could not start the Salesforce connector: its sign-in or settings could not "
-            "be read. Syncs fail until this is fixed; sign in to Salesforce again from the "
-            "connector's settings.",
-        ))
+    async def _sync_all_custom_objects(self, api_version: str) -> None:
+        """Discover and sync every queryable custom Salesforce object into searchable Records."""
+        self.logger.info("Syncing Salesforce custom objects (discover + index)...")
+        try:
+            custom_objects = await self._list_custom_sobjects(api_version)
+        except Exception as e:
+            self.logger.error("Custom object discovery failed: %s", e, exc_info=True)
+            return
 
-    def full_sync_coverage(self) -> FullSyncCoverage:
-        """A full sync that skipped a record it could not read did not see all of Salesforce:
-        nothing it did not write may be unlinked after it."""
-        return FullSyncCoverage(complete=self._read_everything)
+        grand_total = grand_new = grand_updated = 0
+        for meta in custom_objects:
+            t, n, u = await self._sync_one_custom_object(api_version, meta)
+            grand_total += t
+            grand_new += n
+            grand_updated += u
 
-    def _skip_record(self, kind: str, record_id: Optional[str], error: Exception) -> None:
-        """A row this sync could not turn into a PipesHub record: logged, counted in the
-        sync's notice, and the full sync no longer counts as having read everything."""
-        self.logger.warning("Skipped Salesforce %s %s: %s", kind, record_id, error, exc_info=True)
-        self._problems.skipped_records += 1
-        self._read_everything = False
+        self.logger.info(
+            "Finished Salesforce custom objects: %d objects considered, %d rows synced (%d new, %d updated)",
+            len(custom_objects), grand_total, grand_new, grand_updated,
+        )
 
-    async def _run_sync(self) -> None:
+    async def _process_custom_object_record(self, record: Record) -> bytes:
+        """Stream markdown content for a synced custom-object Record (RecordType.OTHERS)."""
+        if not self.data_source:
+            raise connector_not_ready(self.display_name)
+
+        group_id = record.external_record_group_id or ""
+        if not group_id.startswith(_CUSTOM_OBJECT_GROUP_PREFIX):
+            raise HTTPException(
+                status_code=HttpStatusCode.BAD_REQUEST.value,
+                detail=f"Unsupported custom record group: {group_id}",
+            )
+        api_name = group_id[len(_CUSTOM_OBJECT_GROUP_PREFIX):]
+        record_id = record.external_record_id
+        api_version = await self._get_api_version()
+
+        try:
+            safe_id = _sanitize_soql_id(record_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=HttpStatusCode.BAD_REQUEST.value,
+                detail="Invalid record ID",
+            )
+
+        fields_meta = await self._describe_custom_sobject_fields(api_version, api_name)
+        select_fields = _select_custom_object_fields(fields_meta) if fields_meta else ["Id"]
+        name_field = _pick_custom_object_name_field(fields_meta) if fields_meta else None
+        field_list = ", ".join(select_fields)
+        soql = f"SELECT {field_list} FROM {api_name} WHERE Id = '{safe_id}'"
+        row = await self._fetch_first_record(api_version=api_version, soql=soql)
+        if row is None:
+            raise not_found_at_source(self.display_name)
+
+        # Avoid a full describe-global on every stream; api_name is enough for indexing text.
+        label = api_name.replace("__c", "").replace("_", " ")
+
+        _, markdown = _format_custom_object_markdown(api_name, label, row, name_field)
+        weburl = record.weburl
+        block_group = BlockGroup(
+            id=str(uuid4()),
+            index=0,
+            name=record.record_name or label,
+            type=GroupType.TEXT_SECTION,
+            sub_type=GroupSubType.CONTENT,
+            description=f"Salesforce custom object {api_name}",
+            source_group_id=f"{record_id}_custom_fields",
+            data=markdown,
+            format=DataFormat.MARKDOWN,
+            weburl=str(weburl) if weburl else None,
+            requires_processing=True,
+        )
+        blocks_container = BlocksContainer(blocks=[], block_groups=[block_group])
+        return blocks_container.model_dump_json(indent=2).encode("utf-8")
+
+
+    async def run_sync(self) -> None:
             """
             Runs a full synchronization from the Salesforce instance.
             Syncs roles first (with hierarchy), then users with role permissions.
             """
             await self._reinitialize_token_if_needed()
             if not self.data_source:
-                raise connector_not_ready(self.display_name)
+                self.logger.error("Salesforce data source not initialized")
+                return
 
-            # Every step's checkpoint is this moment less an overlap: a record saved while a
-            # step reads carries an earlier stamp than the step's end (sync_window.py).
-            run_started_ms = get_epoch_timestamp_in_ms()
             try:
                 self.logger.info("Starting Salesforce full sync.")
 
@@ -2721,38 +3039,26 @@ class SalesforceConnector(BaseConnector):
                 api_version = await self._get_api_version()
                 await self._register_authenticated_identity(api_version)
 
-                # A full sync clears every checkpoint: track what it writes (see _full_run_parents).
-                deals_point = await self.records_sync_point.read_sync_point(DEALS_SYNC_POINT_KEY) or {}
-                full_run = (
-                    self.data_entities_processor.full_sync_running(self.connector_id)
-                    or not deals_point.get("lastSyncTimestamp")
-                )
-                self._full_run_parents = set() if full_run else None
-                # Deals, cases and tasks whose record group changed this run: their files move too.
-                self._moved_parents = set()
-
                 # Step 1: Incremental sync for users
                 self.logger.info("Syncing users (incremental)...")
                 user_sync_point = await self.user_sync_point.read_sync_point(USERS_SYNC_POINT_KEY)
                 last_sync_ts_ms = user_sync_point.get("lastSyncTimestamp")
                 base_soql = (
-                    "SELECT Id, FirstName, LastName, Email, Phone, MobilePhone, Title, IsActive, CreatedDate, "
-                    "LastModifiedDate, UserRoleId FROM User"
+                    "SELECT Id, FirstName, LastName, Email, Phone, MobilePhone, Title, CreatedDate, LastModifiedDate, UserRoleId FROM User"
                 )
                 if last_sync_ts_ms:
-                    soql_datetime = to_soql_datetime(last_sync_ts_ms)
+                    soql_datetime = epoch_ms_to_iso(last_sync_ts_ms)
                     soql_query = f"{base_soql} WHERE LastModifiedDate >= {soql_datetime} ORDER BY LastModifiedDate ASC"
                     self.logger.debug("Incremental user sync: fetching users modified since %s", soql_datetime)
                 else:
                     soql_query = f"{base_soql} ORDER BY LastModifiedDate ASC"
                     self.logger.debug("Full user sync: no previous sync point, fetching all users")
-                inactive_user_ids = await self._sync_users(
+                await self._sync_users(
                     self._soql_query_paginated(api_version=api_version, q=soql_query),
                 )
-                await self._withdraw_ineligible_users(api_version, inactive_user_ids)
                 await self.user_sync_point.update_sync_point(
                     USERS_SYNC_POINT_KEY,
-                    {"lastSyncTimestamp": checkpoint_for(run_started_ms)},
+                    {"lastSyncTimestamp": get_epoch_timestamp_in_ms()},
                 )
 
                 # Step 2: Incremental sync for roles
@@ -2762,7 +3068,7 @@ class SalesforceConnector(BaseConnector):
                 base_roles_soql = "SELECT Id, Name, ParentRoleId, DeveloperName, SystemModstamp FROM UserRole"
                 base_user_to_role_soql = "SELECT Id, FirstName, LastName, Email, Phone, MobilePhone, Title, CreatedDate, LastModifiedDate, UserRoleId FROM User WHERE UserRoleId != null"
                 if roles_last_ts_ms:
-                    soql_datetime = to_soql_datetime(roles_last_ts_ms)
+                    soql_datetime = epoch_ms_to_iso(roles_last_ts_ms)
                     soql_query = f"{base_roles_soql} WHERE SystemModstamp >= {soql_datetime} ORDER BY SystemModstamp ASC"
                     soql_user_to_role_query = f"{base_user_to_role_soql} AND LastModifiedDate >= {soql_datetime} ORDER BY LastModifiedDate ASC"
                     self.logger.debug("Incremental roles sync: fetching since %s", soql_datetime)
@@ -2776,7 +3082,7 @@ class SalesforceConnector(BaseConnector):
                 )
                 await self.records_sync_point.update_sync_point(
                     ROLES_SYNC_POINT_KEY,
-                    {"lastSyncTimestamp": checkpoint_for(run_started_ms)},
+                    {"lastSyncTimestamp": get_epoch_timestamp_in_ms()},
                 )
 
                 # Step 3: Full sync for Public Groups and Queues
@@ -2793,14 +3099,17 @@ class SalesforceConnector(BaseConnector):
                 self.logger.info("Syncing Accounts and sales prospect edges (incremental)...")
                 accounts_sync_point = await self.records_sync_point.read_sync_point(ACCOUNTS_SYNC_POINT_KEY)
                 accounts_last_ts_ms = accounts_sync_point.get("lastSyncTimestamp")
-                soql_accounts_query = (
-                    "SELECT Name, Website, Industry, Ownership, Phone, DunsNumber, Owner.Name, Type, Rating, "
-                    "Id, CreatedDate, LastModifiedDate, SystemModstamp, "
-                    "(SELECT Id, CloseDate, IsWon, IsClosed FROM Opportunities ORDER BY CloseDate ASC) "
-                    "FROM Account"
-                )
+                # Optional fields are interpolated as bare SOQL identifiers, which is
+                # why the earlier `safe_ids` whitelist pattern exists -- SOQL has no
+                # binding mechanism, so a caller-supplied value would be an injection
+                # vector. These names are not caller-supplied: they come back from the
+                # org's own describe metadata for the object being queried, so the
+                # server is vouching for their validity as identifiers.
+                optional_account_fields = await self._resolve_optional_account_fields(api_version)
+                self._account_optional_fields = optional_account_fields
+                soql_accounts_query = self._build_accounts_soql(optional_account_fields)
                 if accounts_last_ts_ms:
-                    soql_datetime = to_soql_datetime(accounts_last_ts_ms)
+                    soql_datetime = epoch_ms_to_iso(accounts_last_ts_ms)
                     self.logger.debug("Incremental account sync: fetching accounts changed since %s", soql_datetime)
                     account_pages = self._get_updated_account(
                         api_version=api_version,
@@ -2816,19 +3125,17 @@ class SalesforceConnector(BaseConnector):
                 newly_synced_account_ids = await self._sync_accounts(account_pages)
                 await self.records_sync_point.update_sync_point(
                     ACCOUNTS_SYNC_POINT_KEY,
-                    {"lastSyncTimestamp": checkpoint_for(run_started_ms)},
+                    {"lastSyncTimestamp": get_epoch_timestamp_in_ms()},
                 )
 
                 # Step 5: Incremental sync for Contacts
                 self.logger.info("Syncing Contacts and sales contact edges (incremental)...")
                 contacts_sync_point = await self.records_sync_point.read_sync_point(CONTACTS_SYNC_POINT_KEY)
                 contacts_last_ts_ms = contacts_sync_point.get("lastSyncTimestamp")
-                base_contacts_soql = (
-                    "SELECT Id, FirstName, LastName, Email, Phone, AccountId, Account.Name, Title, Department, "
-                    "Description, LeadSource, CreatedDate, LastModifiedDate FROM Contact"
-                )
+                optional_contact_fields = await self._resolve_optional_contact_fields(api_version)
+                base_contacts_soql = self._build_contacts_soql(optional_contact_fields)
                 if contacts_last_ts_ms:
-                    soql_datetime = to_soql_datetime(contacts_last_ts_ms)
+                    soql_datetime = epoch_ms_to_iso(contacts_last_ts_ms)
                     soql_contacts_query = f"{base_contacts_soql} WHERE LastModifiedDate >= {soql_datetime} ORDER BY LastModifiedDate ASC"
                     self.logger.debug("Incremental contacts sync: fetching since %s", soql_datetime)
                 else:
@@ -2839,20 +3146,17 @@ class SalesforceConnector(BaseConnector):
                 )
                 await self.records_sync_point.update_sync_point(
                     CONTACTS_SYNC_POINT_KEY,
-                    {"lastSyncTimestamp": checkpoint_for(run_started_ms)},
+                    {"lastSyncTimestamp": get_epoch_timestamp_in_ms()},
                 )
 
                 # Step 6: Incremental sync for Leads
                 self.logger.info("Syncing Leads and sales lead edges (incremental)...")
                 leads_sync_point = await self.records_sync_point.read_sync_point(LEADS_SYNC_POINT_KEY)
                 leads_last_ts_ms = leads_sync_point.get("lastSyncTimestamp")
-                base_leads_soql = (
-                    "SELECT Id, FirstName, LastName, Email, Phone, Company, Title, Status, "
-                    "Rating, Industry, LeadSource, AnnualRevenue, CreatedDate, LastModifiedDate, ConvertedDate, "
-                    "ConvertedContactId FROM Lead"
-                )
+                optional_lead_fields = await self._resolve_optional_lead_fields(api_version)
+                base_leads_soql = self._build_leads_soql(optional_lead_fields)
                 if leads_last_ts_ms:
-                    soql_datetime = to_soql_datetime(leads_last_ts_ms)
+                    soql_datetime = epoch_ms_to_iso(leads_last_ts_ms)
                     soql_leads_query = f"{base_leads_soql} WHERE LastModifiedDate >= {soql_datetime} ORDER BY LastModifiedDate ASC"
                     self.logger.debug("Incremental leads sync: fetching since %s", soql_datetime)
                 else:
@@ -2863,14 +3167,28 @@ class SalesforceConnector(BaseConnector):
                 )
                 await self.records_sync_point.update_sync_point(
                     LEADS_SYNC_POINT_KEY,
-                    {"lastSyncTimestamp": checkpoint_for(run_started_ms)},
+                    {"lastSyncTimestamp": get_epoch_timestamp_in_ms()},
                 )
+
+                # Step 6.5: Custom objects (Candidates and other __c objects) — run
+                # before Opportunities so a FeedItem/Opportunity failure cannot skip ATS data.
+                await self._sync_all_custom_objects(api_version)
 
                 # Step 7: Incremental sync for Products
                 # 7.1 Ensure product record group exists (org -> record group BELONGS_TO + org -> record group PERMISSION)
-                # Its readers (the users who may read Product2) are written by the
-                # permission step; None keeps them until then.
-                await self.data_entities_processor.on_new_record_groups([(self._product_record_group(), None)])
+                product_record_group = RecordGroup(
+                    name="Products",
+                    external_group_id= self.data_entities_processor.org_id + "-product",
+                    group_type=RecordGroupType.PRODUCT,
+                    connector_name=self.connector_name,
+                    connector_id=self.connector_id,
+                )
+                # Platform permission: org can read the product record group (enables org-level access to product records)
+                org_permission = Permission(
+                    entity_type=EntityType.ORG,
+                    type=PermissionType.READ,
+                )
+                await self.data_entities_processor.on_new_record_groups([(product_record_group, [org_permission])])
                 self.logger.debug("Product record group ensured.")
 
                 self.logger.info("Syncing Products (incremental)...")
@@ -2878,25 +3196,22 @@ class SalesforceConnector(BaseConnector):
                 products_last_ts_ms = products_sync_point.get("lastSyncTimestamp")
                 base_products_soql = (
                     "SELECT Id, Name, ProductCode, Family, IsActive, "
-                    "StockKeepingUnit, CreatedDate, LastModifiedDate, SystemModstamp FROM Product2"
+                    "StockKeepingUnit, CreatedDate, LastModifiedDate FROM Product2"
                 )
                 await self._sync_products(
                     self._get_updated_product(api_version, products_last_ts_ms, base_products_soql),
                 )
                 await self.records_sync_point.update_sync_point(
                     PRODUCTS_SYNC_POINT_KEY,
-                    {"lastSyncTimestamp": checkpoint_for(run_started_ms)},
+                    {"lastSyncTimestamp": get_epoch_timestamp_in_ms()},
                 )
 
                 # Step 8: Incremental sync for Opportunities as deals, record groups per account, dealOf/dealInfo/permission edges
                 self.logger.info("Syncing Opportunities (deals) (incremental)...")
                 opportunities_sync_point = await self.records_sync_point.read_sync_point(DEALS_SYNC_POINT_KEY)
                 opportunities_last_ts_ms = opportunities_sync_point.get("lastSyncTimestamp")
-                base_opportunities_soql = (
-                    "SELECT Id, Name, AccountId, Account.Name, StageName, Amount, ExpectedRevenue, CloseDate, "
-                    "Probability, Type, Description, OwnerId, Owner.Name, IsWon, IsClosed, "
-                    "CreatedDate, LastModifiedDate FROM Opportunity"
-                )
+                optional_opportunity_fields = await self._resolve_optional_opportunity_fields(api_version)
+                base_opportunities_soql = self._build_opportunities_soql(optional_opportunity_fields)
                 _opp_extra_where: list[str] = _date_bound_conditions(
                     "CreatedDate", opp_case_created_after_ms, opp_case_created_before_ms
                 )
@@ -2915,11 +3230,18 @@ class SalesforceConnector(BaseConnector):
                     opp_pages = self._filter_pages_by_last_modified(
                         opp_pages, opp_case_updated_after_ms, opp_case_updated_before_ms,
                     )
-                newly_synced_opp_ids = await self._sync_opportunities(opp_pages)
-                await self.records_sync_point.update_sync_point(
-                    DEALS_SYNC_POINT_KEY,
-                    {"lastSyncTimestamp": checkpoint_for(run_started_ms)},
-                )
+                try:
+                    newly_synced_opp_ids = await self._sync_opportunities(opp_pages)
+                    await self.records_sync_point.update_sync_point(
+                        DEALS_SYNC_POINT_KEY,
+                        {"lastSyncTimestamp": get_epoch_timestamp_in_ms()},
+                    )
+                except Exception as opp_ex:
+                    self.logger.error(
+                        "Opportunities sync failed (continuing with other objects): %s",
+                        opp_ex, exc_info=True,
+                    )
+                    newly_synced_opp_ids = set()
 
                 # Step 8.5: Sync soldIn edges (Product -> Deal) from OpportunityLineItems
                 self.logger.info("Syncing soldIn edges (Product -> Deal) from OpportunityLineItems...")
@@ -2930,7 +3252,7 @@ class SalesforceConnector(BaseConnector):
                     "CreatedDate, LastModifiedDate, IsDeleted FROM OpportunityLineItem"
                 )
                 if products_last_ts_ms:
-                    soql_datetime = to_soql_datetime(products_last_ts_ms)
+                    soql_datetime = epoch_ms_to_iso(products_last_ts_ms)
                     soql_sold_in_query = f"{base_sold_in_soql} WHERE LastModifiedDate > {soql_datetime} ORDER BY LastModifiedDate ASC"
                     self.logger.debug("Incremental OpportunityLineItem sync: fetching since %s", soql_datetime)
                 else:
@@ -2944,7 +3266,7 @@ class SalesforceConnector(BaseConnector):
                 )
                 await self.records_sync_point.update_sync_point(
                     SOLD_IN_SYNC_POINT_KEY,
-                    {"lastSyncTimestamp": checkpoint_for(run_started_ms)},
+                    {"lastSyncTimestamp": get_epoch_timestamp_in_ms()},
                 )
 
                 # Step 9: Incremental sync for Cases
@@ -2990,7 +3312,7 @@ class SalesforceConnector(BaseConnector):
                 newly_synced_case_ids = await self._sync_cases(case_pages)
                 await self.records_sync_point.update_sync_point(
                     CASES_SYNC_POINT_KEY,
-                    {"lastSyncTimestamp": checkpoint_for(run_started_ms)},
+                    {"lastSyncTimestamp": get_epoch_timestamp_in_ms()},
                 )
 
                 # Collect parent IDs that became eligible for the first time in this cycle.
@@ -3049,25 +3371,19 @@ class SalesforceConnector(BaseConnector):
                 )
                 await self.records_sync_point.update_sync_point(
                     TASKS_SYNC_POINT_KEY,
-                    {"lastSyncTimestamp": checkpoint_for(run_started_ms)},
+                    {"lastSyncTimestamp": get_epoch_timestamp_in_ms()},
                 )
 
                 # Step 11: Sync Files
                 self.logger.info("Syncing Files (incremental)...")
                 files_sync_point = await self.records_sync_point.read_sync_point(FILES_SYNC_POINT_KEY)
                 files_last_ts_ms = files_sync_point.get("lastSyncTimestamp")
-                layout = await self.records_sync_point.read_sync_point(FILES_LAYOUT_SYNC_POINT_KEY) or {}
-                if (layout.get("version") or 0) < FILES_LAYOUT_VERSION:
-                    # Files stored by older versions sit in the org-wide files group: read every
-                    # file once so each moves under the record it is attached to.
-                    files_last_ts_ms = None
                 await self._sync_files(
                     api_version=api_version,
                     file_records_pages=self._get_updated_file(
                         api_version,
                         files_last_ts_ms,
-                        # A parent that moved to another record group takes its files along.
-                        newly_synced_parent_ids=newly_synced_parent_ids | self._moved_parents,
+                        newly_synced_parent_ids=newly_synced_parent_ids,
                     ),
                     created_after_ms=opp_case_created_after_ms,
                     created_before_ms=opp_case_created_before_ms,
@@ -3076,22 +3392,8 @@ class SalesforceConnector(BaseConnector):
                 )
                 await self.records_sync_point.update_sync_point(
                     FILES_SYNC_POINT_KEY,
-                    {"lastSyncTimestamp": checkpoint_for(run_started_ms)},
+                    {"lastSyncTimestamp": get_epoch_timestamp_in_ms()},
                 )
-                await self.records_sync_point.update_sync_point(
-                    FILES_LAYOUT_SYNC_POINT_KEY, {"version": FILES_LAYOUT_VERSION},
-                )
-
-                # Step 11.5: take out what Salesforce deleted since the last sync (getDeleted),
-                # before the permission step asks Salesforce about those records.
-                self.logger.info("Removing records deleted in Salesforce...")
-                await self._deletions(api_version).run(
-                    api_version, run_started_ms, full_run=self._full_run_parents is not None,
-                )
-                if self._full_run_parents is None:
-                    # A full sync unlinks every copy it did not write; an incremental one checks
-                    # that each stored file is still on its record.
-                    await self._file_links(api_version).run()
 
                 # Step 12: Sync permissions edges
                 self.logger.info("Syncing permissions edges...")
@@ -3102,8 +3404,6 @@ class SalesforceConnector(BaseConnector):
             except Exception as ex:
                 self.logger.error(f"Error in Salesforce connector run: {ex}", exc_info=True)
                 raise
-            finally:
-                self._full_run_parents = None
 
     async def get_updated_record_ids(
             self,
@@ -3122,7 +3422,7 @@ class SalesforceConnector(BaseConnector):
                 return set()
 
             api_version = await self._get_api_version()
-            cutoff_datetime = to_soql_datetime(since_timestamp_ms)
+            cutoff_datetime = epoch_ms_to_iso(since_timestamp_ms)
             updated_record_ids: Set[str] = set()
 
             # ── Query 1: FeedItems created or modified since cutoff ──────────────
@@ -3332,134 +3632,24 @@ class SalesforceConnector(BaseConnector):
 
     async def _sync_users(
         self, user_records_pages: SalesforceRawPageStream,
-    ) -> set[str]:
+    ) -> None:
         """Sync users from Salesforce, committing each Salesforce page in its own
         transaction.  Per-page commit semantics: a crash mid-stream leaves earlier
-        pages persisted; the sync point is only advanced if every page completes.
-
-        Returns the ids of the users Salesforce reports inactive: they cannot sign in,
-        so they are not linked to the connector (see ``_withdraw_ineligible_users``)."""
+        pages persisted; the sync point is only advanced if every page completes."""
         try:
             total = 0
-            inactive: set[str] = set()
             async for page in user_records_pages:
                 if not page:
                     continue
                 parsed_users = [SalesforceUser.model_validate(r) for r in page]
-                inactive.update(u.Id for u in parsed_users if u.Id and u.IsActive is False)
-                app_users = [self.user_to_app_user(u) for u in parsed_users if u.IsActive is not False]
+                app_users = [self.user_to_app_user(u) for u in parsed_users]
                 if app_users:
                     await self.data_entities_processor.on_new_app_users(app_users)
                     total += len(app_users)
-            self.logger.info("Finished syncing %d Salesforce users (%d inactive)", total, len(inactive))
-            return inactive
+            self.logger.info("Finished syncing %d Salesforce users", total)
         except Exception as e:
             self.logger.error(f"Error syncing users: {e}", exc_info=True)
             raise
-
-    def _deletions(self, api_version: str) -> SalesforceDeletions:
-        def list_ids(soql: str, *, query_all: bool) -> SalesforceRawPageStream:
-            return self._soql_query_paginated(api_version=api_version, q=soql, queryAll=query_all)
-        return SalesforceDeletions(
-            data_source=self.data_source,
-            processor=self.data_entities_processor,
-            data_store_provider=self.data_store_provider,
-            sync_point=self.records_sync_point,
-            connector_id=self.connector_id,
-            logger=self.logger,
-            now_ms=lambda: get_epoch_timestamp_in_ms(),
-            list_ids=list_ids,
-        )
-
-    def _file_links(self, api_version: str) -> SalesforceFileLinks:
-        def rows(soql: str) -> SalesforceRawPageStream:
-            return self._soql_query_paginated(api_version=api_version, q=soql)
-        return SalesforceFileLinks(rows, self.data_entities_processor, self.data_store_provider,
-                                   self.connector_id, self.logger)
-
-    async def _feed_pages(self, api_version: str, q: str) -> SalesforceRawPageStream:
-        """Pages of a FeedItem or FeedComment query that finds deals and cases whose
-        discussion changed. Two answers mean the org will never list them, and the rest of
-        the sync goes on without: no Chatter in the org (INVALID_TYPE), and a connected user
-        without View All Data, whom Salesforce does not let list posts (the admin is told).
-        Any other failure raises, so the step's checkpoint stays and the next sync reads again."""
-        try:
-            async for page in self._soql_query_paginated(api_version=api_version, q=q):
-                yield page
-        except Exception as e:
-            answer = salesforce_error(e)
-            if answer is not None and answer.error_code == "INVALID_TYPE":
-                self.logger.debug("This Salesforce org has no Chatter: %s", answer)
-                return
-            if answer is not None and answer.error_code == "MALFORMED_QUERY" and (
-                "View All Data" in answer.detail or "filter by Id" in answer.detail
-            ):
-                self.logger.warning("Chatter posts cannot be listed by the connected user: %s", answer)
-                self._problems.note(CHATTER_NEEDS_VIEW_ALL)
-                return
-            raise
-
-    def _eligibility(self, api_version: str) -> SalesforceEligibility:
-        def rows(soql: str) -> SalesforceRawPageStream:
-            return self._soql_query_paginated(api_version=api_version, q=soql)
-        return SalesforceEligibility(rows, self.logger,
-                                     on_unreadable=lambda what: self._problems.note(unreadable_list(what)))
-
-    async def _eligible_emails(self, api_version: str, frozen: Optional[set[str]]) -> Optional[set[str]]:
-        """Lower-cased emails of the Salesforce users who can sign in; None when unreadable."""
-        emails: set[str] = set()
-        try:
-            async for page in self._soql_query_paginated(
-                api_version=api_version, q="SELECT Id, Email FROM User WHERE IsActive = true",
-            ):
-                emails.update(
-                    u["Email"].lower() for u in page
-                    if u.get("Email") and u.get("Id") not in (frozen or set())
-                )
-        except Exception as e:  # unknown, so nobody is withdrawn
-            self.logger.warning("Could not list the active Salesforce users: %s", e)
-            self._problems.note(unreadable_list("active users"))
-            return None
-        return emails
-
-    async def _withdraw_ineligible_users(self, api_version: str, inactive_user_ids: set[str]) -> None:
-        """Take the connector away from users who cannot sign in to Salesforce: inactive and
-        frozen ones (both read in full every sync; freezing does not change the User row).
-        A user unfrozen since the last sync is linked again. A list that cannot be read
-        withdraws nobody on its account."""
-        eligibility = self._eligibility(api_version)
-        # Read in full every sync: an install upgraded from a version that linked inactive
-        # users never sees them again in the incremental user list.
-        inactive = await eligibility.inactive_user_ids()
-        frozen = await eligibility.frozen_user_ids()
-        point = await self.user_sync_point.read_sync_point(FROZEN_USERS_SYNC_POINT_KEY) or {}
-        previously_frozen = set(point.get("userIds") or [])
-        ineligible = set(inactive_user_ids) | (inactive or set()) | (frozen or set())
-        if ineligible:
-            # Salesforce emails are not unique: a PipesHub user keeps the connector while any
-            # Salesforce user with their email can still sign in.
-            eligible = await self._eligible_emails(api_version, frozen)
-            if eligible is not None:
-                stored = await self.data_entities_processor.get_all_app_users(self.connector_id)
-                gone = [u for u in stored
-                        if u.source_user_id in ineligible and (u.email or "").lower() not in eligible]
-                if gone:
-                    await self.data_entities_processor.withdraw_app_user_access(self.connector_id, gone)
-        if frozen is None:
-            return
-        thawed = sorted(previously_frozen - frozen)
-        if thawed:
-            safe = _sanitize_soql_ids_batch(thawed, self.logger, "unfrozen users")
-            if safe:
-                ids_clause = "','".join(safe)
-                soql = (
-                    "SELECT Id, FirstName, LastName, Email, Phone, MobilePhone, Title, IsActive, CreatedDate, "
-                    f"LastModifiedDate, UserRoleId FROM User WHERE Id IN ('{ids_clause}')"
-                )
-                await self._sync_users(self._soql_query_paginated(api_version=api_version, q=soql))
-        await self.user_sync_point.update_sync_point(
-            FROZEN_USERS_SYNC_POINT_KEY, {"userIds": sorted(frozen)},
-        )
 
     async def _sync_roles(
         self,
@@ -3970,15 +4160,14 @@ class SalesforceConnector(BaseConnector):
         3. If the result has no rows returns None.
         4. Builds and returns the typed record using the appropriate _build_* method.
         """
-        soql_datetime = to_soql_datetime(since_timestamp_ms)
+        soql_datetime = epoch_ms_to_iso(since_timestamp_ms)
 
         try:
             if record_type == RecordType.DEAL:
                 safe_id = _sanitize_soql_id(external_id)
+                optional_opportunity_fields = await self._resolve_optional_opportunity_fields(api_version)
                 soql = (
-                    "SELECT Id, Name, AccountId, Account.Name, StageName, Amount, ExpectedRevenue, CloseDate, "
-                    "Probability, Type, Description, OwnerId, Owner.Name, IsWon, IsClosed, "
-                    f"CreatedDate, LastModifiedDate FROM Opportunity "
+                    f"{self._build_opportunities_soql(optional_opportunity_fields)} "
                     f"WHERE Id = '{safe_id}' AND LastModifiedDate >= {soql_datetime}"
                 )
                 row = await self._fetch_first_record(api_version=api_version, soql=soql)
@@ -4035,7 +4224,7 @@ class SalesforceConnector(BaseConnector):
                 safe_id = _sanitize_soql_id(external_id)
                 soql = (
                     "SELECT Id, Name, ProductCode, Family, IsActive, "
-                    "StockKeepingUnit, CreatedDate, LastModifiedDate, SystemModstamp FROM Product2 "
+                    "StockKeepingUnit, CreatedDate, LastModifiedDate FROM Product2 "
                     f"WHERE Id = '{safe_id}' AND LastModifiedDate >= {soql_datetime}"
                 )
                 row = await self._fetch_first_record(api_version=api_version, soql=soql)
@@ -4101,41 +4290,41 @@ class SalesforceConnector(BaseConnector):
         extra = extra_where_conditions or []
 
         if opportunities_last_ts_ms:
-            soql_datetime = to_soql_datetime(opportunities_last_ts_ms)
+            soql_datetime = epoch_ms_to_iso(opportunities_last_ts_ms)
 
             soql_modified = (
                 f"{base_opportunities_soql} "
-                f"{_compose_soql_where(f'SystemModstamp >= {soql_datetime}', *extra)} "
+                f"{_compose_soql_where(f'LastModifiedDate >= {soql_datetime}', *extra)} "
                 f"ORDER BY LastModifiedDate ASC"
             )
             soql_feeditems = (
                 f"{base_opportunities_soql} "
-                f"{_compose_soql_where(f'Id IN (SELECT ParentId FROM FeedItem WHERE SystemModstamp >= {soql_datetime})', 'IsDeleted = false', *extra)}"
+                f"{_compose_soql_where(f'Id IN (SELECT ParentId FROM FeedItem WHERE CreatedDate >= {soql_datetime})', 'IsDeleted = false', *extra)}"
             )
             soql_feedcomments = (
                 f"{base_opportunities_soql} "
-                f"{_compose_soql_where(f'Id IN (SELECT ParentId FROM FeedComment WHERE SystemModstamp >= {soql_datetime})', 'IsDeleted = false', *extra)}"
+                f"{_compose_soql_where(f'Id IN (SELECT ParentId FROM FeedComment WHERE CreatedDate >= {soql_datetime})', 'IsDeleted = false', *extra)}"
             )
             soql_item_dates = (
-                f"SELECT ParentId, CreatedDate, SystemModstamp FROM FeedItem "
-                f"WHERE SystemModstamp >= {soql_datetime} ORDER BY SystemModstamp DESC"
+                f"SELECT ParentId, CreatedDate FROM FeedItem "
+                f"WHERE CreatedDate >= {soql_datetime} ORDER BY CreatedDate DESC"
             )
             soql_comment_dates = (
-                f"SELECT ParentId, CreatedDate, SystemModstamp FROM FeedComment "
-                f"WHERE SystemModstamp >= {soql_datetime} ORDER BY SystemModstamp DESC"
+                f"SELECT ParentId, CreatedDate FROM FeedComment "
+                f"WHERE CreatedDate >= {soql_datetime} ORDER BY CreatedDate DESC"
             )
 
             # Drain the two small *_dates queries fully (payload is just ParentId + CreatedDate
             # so memory is bounded by |distinct ParentId|, not record size).
             latest_feed_epoch: Dict[str, int] = {}
-            async for date_page in self._feed_pages(
+            async for date_page in self._soql_query_paginated(
                 api_version=api_version, q=soql_item_dates,
             ):
                 _accumulate_latest_feed_epoch(
                     [SalesforceFeedRecord.model_validate(r) for r in date_page],
                     latest_feed_epoch,
                 )
-            async for date_page in self._feed_pages(
+            async for date_page in self._soql_query_paginated(
                 api_version=api_version, q=soql_comment_dates,
             ):
                 _accumulate_latest_feed_epoch(
@@ -4155,7 +4344,7 @@ class SalesforceConnector(BaseConnector):
                 if opps:
                     yield opps
 
-            async for page in self._feed_pages(
+            async for page in self._soql_query_paginated(
                 api_version=api_version, q=soql_feeditems,
             ):
                 total_feeditems += len(page)
@@ -4163,7 +4352,7 @@ class SalesforceConnector(BaseConnector):
                 if opps:
                     yield opps
 
-            async for page in self._feed_pages(
+            async for page in self._soql_query_paginated(
                 api_version=api_version, q=soql_feedcomments,
             ):
                 total_feedcomments += len(page)
@@ -4220,8 +4409,8 @@ class SalesforceConnector(BaseConnector):
         when no sync point is available.
         """
         if products_last_ts_ms:
-            soql_datetime = to_soql_datetime(products_last_ts_ms)
-            soql = f"{base_products_soql} WHERE SystemModstamp >= {soql_datetime} ORDER BY SystemModstamp ASC"
+            soql_datetime = epoch_ms_to_iso(products_last_ts_ms)
+            soql = f"{base_products_soql} WHERE LastModifiedDate >= {soql_datetime} ORDER BY LastModifiedDate ASC"
             self.logger.debug("Incremental products sync: fetching since %s", soql_datetime)
         else:
             soql = f"{base_products_soql} ORDER BY LastModifiedDate ASC"
@@ -4256,39 +4445,39 @@ class SalesforceConnector(BaseConnector):
         extra = extra_where_conditions or []
 
         if cases_last_ts_ms:
-            soql_datetime = to_soql_datetime(cases_last_ts_ms)
+            soql_datetime = epoch_ms_to_iso(cases_last_ts_ms)
 
             soql_modified = (
                 f"{base_cases_soql} "
-                f"{_compose_soql_where(f'SystemModstamp >= {soql_datetime}', *extra)} "
+                f"{_compose_soql_where(f'LastModifiedDate >= {soql_datetime}', *extra)} "
                 f"ORDER BY LastModifiedDate ASC"
             )
             soql_feeditems = (
                 f"{base_cases_soql} "
-                f"{_compose_soql_where(f'Id IN (SELECT ParentId FROM FeedItem WHERE SystemModstamp >= {soql_datetime})', 'IsDeleted = false', *extra)}"
+                f"{_compose_soql_where(f'Id IN (SELECT ParentId FROM FeedItem WHERE CreatedDate >= {soql_datetime})', 'IsDeleted = false', *extra)}"
             )
             soql_feedcomments = (
                 f"{base_cases_soql} "
-                f"{_compose_soql_where(f'Id IN (SELECT ParentId FROM FeedComment WHERE SystemModstamp >= {soql_datetime})', 'IsDeleted = false', *extra)}"
+                f"{_compose_soql_where(f'Id IN (SELECT ParentId FROM FeedComment WHERE CreatedDate >= {soql_datetime})', 'IsDeleted = false', *extra)}"
             )
             soql_item_dates = (
-                f"SELECT ParentId, CreatedDate, SystemModstamp FROM FeedItem "
-                f"WHERE SystemModstamp >= {soql_datetime} ORDER BY SystemModstamp DESC"
+                f"SELECT ParentId, CreatedDate FROM FeedItem "
+                f"WHERE CreatedDate >= {soql_datetime} ORDER BY CreatedDate DESC"
             )
             soql_comment_dates = (
-                f"SELECT ParentId, CreatedDate, SystemModstamp FROM FeedComment "
-                f"WHERE SystemModstamp >= {soql_datetime} ORDER BY SystemModstamp DESC"
+                f"SELECT ParentId, CreatedDate FROM FeedComment "
+                f"WHERE CreatedDate >= {soql_datetime} ORDER BY CreatedDate DESC"
             )
 
             latest_feed_epoch: Dict[str, int] = {}
-            async for date_page in self._feed_pages(
+            async for date_page in self._soql_query_paginated(
                 api_version=api_version, q=soql_item_dates,
             ):
                 _accumulate_latest_feed_epoch(
                     [SalesforceFeedRecord.model_validate(r) for r in date_page],
                     latest_feed_epoch,
                 )
-            async for date_page in self._feed_pages(
+            async for date_page in self._soql_query_paginated(
                 api_version=api_version, q=soql_comment_dates,
             ):
                 _accumulate_latest_feed_epoch(
@@ -4307,7 +4496,7 @@ class SalesforceConnector(BaseConnector):
                 if cases:
                     yield cases
 
-            async for page in self._feed_pages(
+            async for page in self._soql_query_paginated(
                 api_version=api_version, q=soql_feeditems,
             ):
                 total_feeditems += len(page)
@@ -4315,7 +4504,7 @@ class SalesforceConnector(BaseConnector):
                 if cases:
                     yield cases
 
-            async for page in self._feed_pages(
+            async for page in self._soql_query_paginated(
                 api_version=api_version, q=soql_feedcomments,
             ):
                 total_feedcomments += len(page)
@@ -4377,9 +4566,8 @@ class SalesforceConnector(BaseConnector):
         LastModifiedDate, deduplicated against Pass 1 via a running `seen_ids` set.
         """
         if tasks_last_ts_ms:
-            soql_datetime = to_soql_datetime(tasks_last_ts_ms)
-            # SystemModstamp: every change moves it, an undelete included (LastModifiedDate may not).
-            soql = f"{base_tasks_soql} WHERE SystemModstamp >= {soql_datetime} ORDER BY SystemModstamp ASC"
+            soql_datetime = epoch_ms_to_iso(tasks_last_ts_ms)
+            soql = f"{base_tasks_soql} WHERE LastModifiedDate >= {soql_datetime} ORDER BY LastModifiedDate ASC"
             self.logger.debug("Incremental tasks sync: fetching since %s", soql_datetime)
         else:
             soql = f"{base_tasks_soql} ORDER BY LastModifiedDate ASC"
@@ -4462,7 +4650,7 @@ class SalesforceConnector(BaseConnector):
         )
 
         if files_last_ts_ms:
-            soql_datetime = to_soql_datetime(files_last_ts_ms)
+            soql_datetime = epoch_ms_to_iso(files_last_ts_ms)
             soql = f"{base_files_soql} AND LastModifiedDate >= {soql_datetime} ORDER BY LastModifiedDate ASC"
             self.logger.debug("Incremental files sync: fetching since %s", soql_datetime)
         else:
@@ -4742,26 +4930,27 @@ class SalesforceConnector(BaseConnector):
         try:
             newly_synced_account_ids: Set[str] = set()
             org_id = self.data_entities_processor.org_id
+            parent_org_id = self._get_parent_org_id()
 
             # One-time setup: snapshot existing external orgs into a name -> _key map.
             # Updated in place each page so that newly upserted orgs are recognized as
             # existing on subsequent pages (correct delete-then-recreate behaviour).
             async with self.data_store_provider.transaction() as tx_store:
-                # Unknown is not empty: a failed read would re-create every account.
-                all_orgs = await tx_store.get_all_orgs(raise_on_error=True)
-                own_orgs = await self._own_external_orgs(tx_store, all_orgs or [])
-            external_org_key_by_name: Dict[str, str] = {o["name"]: o["_key"] for o in accounts_last(own_orgs)}
+                all_orgs = await tx_store.get_all_orgs()
+            external_org_key_by_name: Dict[str, str] = {
+                o["name"]: o["_key"]
+                for o in (all_orgs or [])
+                if o.get("isExternal") is True
+                and (parent_org_id is None or o.get("parentOrgId") == parent_org_id)
+            }
 
             total_orgs = 0
             total_record_groups = 0
 
             async for page in account_records_pages:
                 orgs_with_edges: List[Tuple[Org, RecordGroup, Dict, Optional[Dict]]] = []
-                record_groups_with_perms: list[tuple[RecordGroup, Optional[list[Permission]]]] = []
+                record_groups_with_perms: List[Tuple[RecordGroup, List[Permission]]] = []
 
-                for acc in page:
-                    # A long nested Opportunities list comes back in pages of its own.
-                    acc.Opportunities = await self._complete_child_list(acc.Opportunities)
                 for acc in page:
                     try:
                         account_id = acc.Id
@@ -4781,7 +4970,11 @@ class SalesforceConnector(BaseConnector):
                             industry=acc.Industry,
                             ownership_type=acc.Ownership,
                             phone=acc.Phone,
-                            duns_id=acc.DunsNumber,
+                            # Only pass duns_id when the field was actually queried. On a
+                            # full sync here DunsNumber is unset (the org does not serve it),
+                            # and passing the unset value would clobber an existing
+                            # DunsNumber on the Org node with None.
+                            **({"duns_id": acc.DunsNumber} if "DunsNumber" in self._account_optional_fields else {}),
                             source_created_at=start_time_ms,
                             source_updated_at=_parse_salesforce_timestamp(acc.LastModifiedDate),
                         )
@@ -4794,12 +4987,8 @@ class SalesforceConnector(BaseConnector):
                             source_created_at=start_time_ms,
                             source_updated_at=_parse_salesforce_timestamp(acc.LastModifiedDate),
                         )
-                        # None keeps the account's readers: the permission step writes them
-                        # from UserRecordAccess, and [] would clear them until it runs.
-                        record_groups_with_perms.append((record_group, None))
-                        # The edge schemas need non-null timestamps; an account without dates gets now.
-                        edge_created_ms = start_time_ms or get_epoch_timestamp_in_ms()
-                        edge_updated_ms = _parse_salesforce_timestamp(acc.LastModifiedDate) or edge_created_ms
+                        record_groups_with_perms.append((record_group, []))
+                        updated_time_ms = _parse_salesforce_timestamp(acc.LastModifiedDate)
                         prospect_edge = {
                             "to_id": org_node.id,
                             "rating": rating,
@@ -4807,8 +4996,8 @@ class SalesforceConnector(BaseConnector):
                             "externalId": account_id,
                             "startTime": start_time_ms,
                             "endTime": end_time_ms,
-                            "createdAtTimestamp": edge_created_ms,
-                            "updatedAtTimestamp": edge_updated_ms,
+                            "createdAtTimestamp": start_time_ms,
+                            "updatedAtTimestamp": updated_time_ms,
                         }
                         customer_edge: Optional[Dict] = None
                         if end_time_ms is not None:
@@ -4819,12 +5008,12 @@ class SalesforceConnector(BaseConnector):
                                 "activeCustomer": active_customer,
                                 "externalId": account_id,
                                 "since": end_time_ms,
-                                "createdAtTimestamp": edge_created_ms,
-                                "updatedAtTimestamp": edge_updated_ms,
+                                "createdAtTimestamp": start_time_ms,
+                                "updatedAtTimestamp": updated_time_ms,
                             }
                         orgs_with_edges.append((org_node, record_group, prospect_edge, customer_edge))
                     except Exception as e:
-                        self._skip_record("account", acc.Id, e)
+                        self.logger.warning(f"Failed to process account {acc.Id}: {e}")
                         continue
 
                 if not orgs_with_edges:
@@ -4836,39 +5025,17 @@ class SalesforceConnector(BaseConnector):
                     )
                     total_record_groups += len(record_groups_with_perms)
 
-                async def write_orgs(
-                    tx_store: TransactionStore, orgs_with_edges: list[tuple[Org, RecordGroup, dict, dict | None]]
-                ) -> None:
-                    nonlocal external_org_key_by_name
-                    all_orgs = await tx_store.get_all_orgs(is_external=True, raise_on_error=True)
+                async with self.data_store_provider.transaction() as tx_store:
+                    all_orgs = await tx_store.get_all_orgs(is_external=True)
+                    parent_org_id = self._get_parent_org_id()
                     external_org_key_by_name = {
                         o["name"]: o.get("id", o.get("_key"))
-                        for o in accounts_last(await self._own_external_orgs(tx_store, all_orgs))
+                        for o in all_orgs
+                        if parent_org_id is None or o.get("parentOrgId") == parent_org_id
                     }
-                    external_keys = set(external_org_key_by_name.values())
-                    account_owners: dict[str, set[str | None]] | None = None
                     delete_tasks = []
                     for org, rg, _, _ in orgs_with_edges:
                         existing_key = external_org_key_by_name.get(org.name)
-                        adopted = False
-                        if existing_key is not None and existing_key == extracted_organization_id(org_id, org.name):
-                            # Extraction's node found by its exact name: claimed only as below, once per page.
-                            existing_key = None
-                        if existing_key is None:
-                            # A node documents named before the CRM synced the
-                            # account (KG-13 3b): the account takes it over, so
-                            # those records link to it. Only extraction's own
-                            # deterministic key, never another account's.
-                            extracted = extracted_organization_id(org_id, org.name)
-                            # Not a node another account holds, nor one taken earlier in this page.
-                            if extracted in external_keys:
-                                if account_owners is None:
-                                    account_owners = await self._account_org_owners(tx_store)
-                                holders = account_owners.get(extracted, set())
-                                if holders <= {rg.external_group_id}:
-                                    existing_key = extracted
-                                    adopted = not holders  # a rename of its holder is not a first sync
-                                    external_keys.discard(extracted)
                         if existing_key is not None:
                             org.id = existing_key
                             delete_tasks.append(tx_store.delete_edges_to(
@@ -4886,9 +5053,9 @@ class SalesforceConnector(BaseConnector):
                                 CollectionNames.RECORD_GROUPS.value,
                                 CollectionNames.DEAL_OF.value,
                             ))
-                        if (existing_key is None or adopted) and rg.external_group_id:
-                            # An adopted node is old, but the account is first synced now.
-                            newly_synced_account_ids.add(rg.external_group_id)
+                        else:
+                            if rg.external_group_id:
+                                newly_synced_account_ids.add(rg.external_group_id)
                     if delete_tasks:
                         for _del in delete_tasks:
                             await _del
@@ -4941,8 +5108,6 @@ class SalesforceConnector(BaseConnector):
                             dealof_edges, collection=CollectionNames.DEAL_OF.value,
                         )
 
-                await self.data_store_provider.execute_in_transaction(write_orgs, orgs_with_edges)
-
                 total_orgs += len(orgs_with_edges)
 
             self.logger.info(
@@ -4984,21 +5149,17 @@ class SalesforceConnector(BaseConnector):
                             )
                             continue
 
-                        since_ms = _parse_salesforce_timestamp(contact.CreatedDate)
-                        contact_updated_ms = _parse_salesforce_timestamp(contact.LastModifiedDate)
-                        # The person and edge schemas need non-null timestamps; a contact without dates gets now.
-                        edge_created_ms = since_ms or get_epoch_timestamp_in_ms()
-                        edge_updated_ms = contact_updated_ms or edge_created_ms
-
                         person = self._create_person(
                             email=email,
                             org_id=org_id,
                             first_name=contact.FirstName,
                             last_name=contact.LastName,
                             phone=contact.Phone,
-                            created_at=edge_created_ms,
-                            updated_at=edge_updated_ms,
+                            created_at=_parse_salesforce_timestamp(contact.CreatedDate),
+                            updated_at=_parse_salesforce_timestamp(contact.LastModifiedDate),
                         )
+                        since_ms = _parse_salesforce_timestamp(contact.CreatedDate)
+                        contact_updated_ms = _parse_salesforce_timestamp(contact.LastModifiedDate)
 
                         contact_edge = {
                             "to_id": person.id,
@@ -5006,8 +5167,8 @@ class SalesforceConnector(BaseConnector):
                             "leadSource": contact.LeadSource,
                             "since": since_ms,
                             "externalId": contact_id,
-                            "createdAtTimestamp": edge_created_ms,
-                            "updatedAtTimestamp": edge_updated_ms,
+                            "createdAtTimestamp": since_ms,
+                            "updatedAtTimestamp": contact_updated_ms,
                         }
                         member_of_edge: Optional[Dict] = None
                         account_obj = contact.Account or {}
@@ -5018,12 +5179,12 @@ class SalesforceConnector(BaseConnector):
                                 "accountName": account_name,
                                 "title": contact.Title,
                                 "department": contact.Department,
-                                "createdAtTimestamp": edge_created_ms,
-                                "updatedAtTimestamp": edge_updated_ms,
+                                "createdAtTimestamp": since_ms,
+                                "updatedAtTimestamp": contact_updated_ms,
                             }
                         contact_with_edges.append((person, contact_edge, member_of_edge))
                     except Exception as e:
-                        self._skip_record("contact", contact.Id, e)
+                        self.logger.warning(f"Failed to process contact {contact.Id}: {e}")
                         continue
 
                 if not contact_with_edges:
@@ -5042,9 +5203,7 @@ class SalesforceConnector(BaseConnector):
                             dup_contact_ids, dup_email,
                         )
 
-                async def write_contacts(
-                    tx_store: TransactionStore, contact_with_edges: list[tuple[Person, dict, dict | None]]
-                ) -> tuple[list[tuple[Person, dict, dict | None]], set[str]]:
+                async with self.data_store_provider.transaction() as tx_store:
                     all_emails = [p.email.lower() for p, _, _ in contact_with_edges]
                     all_account_names = list({
                         moe.get("accountName")
@@ -5077,7 +5236,11 @@ class SalesforceConnector(BaseConnector):
                     }
                     org_name_map = {
                         node.get("name"): node
-                        for node in accounts_last(await self._own_external_orgs(tx_store, existing_orgs_result or []))
+                        for node in (existing_orgs_result or [])
+                        if parent_org_id is None or (
+                            node.get("isExternal") is True
+                            and node.get("parentOrgId") == parent_org_id
+                        )
                     }
 
                     unchanged_emails: set = set()
@@ -5114,8 +5277,18 @@ class SalesforceConnector(BaseConnector):
                         for p, sce, moe in contact_with_edges
                         if p.email.lower() not in unchanged_emails
                     ]
+                    # Person is uniquely keyed by (orgId, email). Multiple Salesforce
+                    # Contacts often share one email; collapse to one Person per email
+                    # before upsert, then fan CONTACT/MEMBER_OF edges out to that node.
+                    people_by_email: Dict[str, Any] = {}
+                    for p, _, _ in changed_contacts:
+                        key = p.email.lower()
+                        if key not in people_by_email:
+                            people_by_email[key] = p
+                    for p, _sce, _moe in changed_contacts:
+                        p.id = people_by_email[p.email.lower()].id
                     if changed_contacts:
-                        await tx_store.batch_upsert_people([p for p, _, _ in changed_contacts])
+                        await tx_store.batch_upsert_people(list(people_by_email.values()))
 
                     contact_edges = []
                     member_of_edges = []
@@ -5129,18 +5302,16 @@ class SalesforceConnector(BaseConnector):
                                 **contact_edge,
                             })
                         if member_of_edge and contact_edge:
-                            # Read, not popped: a re-run after a deadlock reads it again.
-                            account_name = member_of_edge.get("accountName")
+                            account_name = member_of_edge.pop("accountName", None)
                             if account_name:
                                 org_node = org_name_map.get(account_name)
                                 if org_node:
                                     member_of_edges.append({
-                                        **{k: v for k, v in member_of_edge.items() if k != "accountName"},
-                                        # After the edge's own fields: person.id is the stored one by now.
                                         "from_id": person.id,
                                         "from_collection": CollectionNames.PEOPLE.value,
                                         "to_id": org_node.get("id") or org_node.get("_key"),
                                         "to_collection": CollectionNames.ORGS.value,
+                                        **{k: v for k, v in member_of_edge.items()},
                                     })
 
                     if contact_edges:
@@ -5151,9 +5322,6 @@ class SalesforceConnector(BaseConnector):
                         await tx_store.batch_create_edges(
                             member_of_edges, collection=CollectionNames.MEMBER_OF.value,
                         )
-                    return changed_contacts, unchanged_emails
-
-                changed_contacts, unchanged_emails = await self.data_store_provider.execute_in_transaction(write_contacts, contact_with_edges)
 
                 total_changed += len(changed_contacts)
                 total_unchanged += len(unchanged_emails)
@@ -5195,9 +5363,6 @@ class SalesforceConnector(BaseConnector):
                             _parse_salesforce_timestamp(lead.ConvertedDate)
                             if is_converted else None
                         )
-                        # The person and edge schemas need non-null timestamps; a lead without dates gets now.
-                        edge_created_ms = start_time_ms or get_epoch_timestamp_in_ms()
-                        edge_updated_ms = _parse_salesforce_timestamp(lead.LastModifiedDate) or edge_created_ms
                         edge_attrs = {
                             "company": lead.Company,
                             "title": lead.Title,
@@ -5209,8 +5374,8 @@ class SalesforceConnector(BaseConnector):
                             "externalId": lead_id,
                             "startTime": start_time_ms,
                             "endTime": end_time_ms,
-                            "createdAtTimestamp": edge_created_ms,
-                            "updatedAtTimestamp": edge_updated_ms,
+                            "createdAtTimestamp": start_time_ms,
+                            "updatedAtTimestamp": _parse_salesforce_timestamp(lead.LastModifiedDate),
                         }
                         lead_email = lead.Email
                         if not lead_email:
@@ -5224,18 +5389,18 @@ class SalesforceConnector(BaseConnector):
                             first_name=lead.FirstName,
                             last_name=lead.LastName,
                             phone=lead.Phone,
-                            created_at=edge_created_ms,
-                            updated_at=edge_updated_ms,
+                            created_at=_parse_salesforce_timestamp(lead.CreatedDate),
+                            updated_at=_parse_salesforce_timestamp(lead.LastModifiedDate),
                         )
                         lead_with_edges.append((person, edge_attrs))
                     except Exception as e:
-                        self._skip_record("lead", lead.Id, e)
+                        self.logger.warning(f"Failed to process lead {lead.Id}: {e}")
                         continue
 
                 if not lead_with_edges:
                     continue
 
-                async def write_leads(tx_store: TransactionStore, lead_with_edges: list[tuple[Person, dict]]) -> None:
+                async with self.data_store_provider.transaction() as tx_store:
                     all_emails = [p.email.lower() for p, _ in lead_with_edges]
                     existing_people = await tx_store.get_nodes_by_field_in(
                         collection=CollectionNames.PEOPLE.value,
@@ -5266,7 +5431,18 @@ class SalesforceConnector(BaseConnector):
                             for pid in ids_to_delete
                         ])
 
-                    await tx_store.batch_upsert_people([p for p, _ in lead_with_edges])
+                    # Person is uniquely keyed by (orgId, email). Multiple Leads (and
+                    # Contacts already synced earlier) can share one email — collapse
+                    # to one Person per email before upsert.
+                    people_by_email: Dict[str, Any] = {}
+                    for p, _ in lead_with_edges:
+                        key = p.email.lower()
+                        if key not in people_by_email:
+                            people_by_email[key] = p
+                    for p, _ in lead_with_edges:
+                        p.id = people_by_email[p.email.lower()].id
+
+                    await tx_store.batch_upsert_people(list(people_by_email.values()))
 
                     edges = [
                         {
@@ -5279,8 +5455,6 @@ class SalesforceConnector(BaseConnector):
                         for p, e in lead_with_edges
                     ]
                     await tx_store.batch_create_edges(edges, collection=CollectionNames.LEAD.value)
-
-                await self.data_store_provider.execute_in_transaction(write_leads, lead_with_edges)
 
                 total += len(lead_with_edges)
 
@@ -5356,12 +5530,12 @@ class SalesforceConnector(BaseConnector):
                             product, list_price=price_map.get(product.Id),
                         )
                         if self.indexing_filters and self.indexing_filters.is_enabled(
-                            IndexingFilterKey.ENABLE_MANUAL_SYNC, default=False,
+                            IndexingFilterKey.ENABLE_MANUAL_SYNC,
                         ):
                             record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
                         records.append(record)
                     except Exception as e:
-                        self._skip_record("product", product.Id, e)
+                        self.logger.warning(f"Failed to process product {product.Id}: {e}")
                         continue
 
                 if not records:
@@ -5373,17 +5547,13 @@ class SalesforceConnector(BaseConnector):
                         field="externalRecordId",
                         values=[r.external_record_id for r in records if r.external_record_id],
                     )
-                stored_by_ext = {
-                    node.get("externalRecordId"): node
+                existing_ext_ids = {
+                    node.get("externalRecordId")
                     for node in (existing_nodes or [])
                     if node.get("externalRecordId") and node.get("connectorId") == self.connector_id
                 }
-                new_records = [r for r in records if r.external_record_id not in stored_by_ext]
-                update_records = [
-                    r for r in records
-                    if r.external_record_id in stored_by_ext
-                    and not self._unchanged(stored_by_ext[r.external_record_id], r)
-                ]
+                new_records = [r for r in records if r.external_record_id not in existing_ext_ids]
+                update_records = [r for r in records if r.external_record_id in existing_ext_ids]
 
                 if new_records:
                     await self.data_entities_processor.on_new_records(
@@ -5391,7 +5561,6 @@ class SalesforceConnector(BaseConnector):
                     )
                 for record in update_records:
                     await self.data_entities_processor.on_record_content_update(record)
-                self._note_written(records)
 
                 total += len(records)
                 total_new += len(new_records)
@@ -5450,15 +5619,14 @@ class SalesforceConnector(BaseConnector):
                         continue
                     record = self._build_deal_record(opp)
                     if self.indexing_filters and self.indexing_filters.is_enabled(
-                        IndexingFilterKey.ENABLE_MANUAL_SYNC, default=False,
+                        IndexingFilterKey.ENABLE_MANUAL_SYNC,
                     ):
                         record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
                     records.append(record)
                     deal_info_edge = {
                         "stage": opp.StageName or "",
-                        # The edge schema needs non-null timestamps; an opportunity without dates gets now.
-                        "createdAtTimestamp": _parse_salesforce_timestamp(opp.CreatedDate) or get_epoch_timestamp_in_ms(),
-                        "updatedAtTimestamp": _parse_salesforce_timestamp(opp.LastModifiedDate) or get_epoch_timestamp_in_ms(),
+                        "createdAtTimestamp": _parse_salesforce_timestamp(opp.CreatedDate),
+                        "updatedAtTimestamp": _parse_salesforce_timestamp(opp.LastModifiedDate),
                     }
                     opportunity_with_edges.append((record, deal_info_edge))
 
@@ -5471,18 +5639,13 @@ class SalesforceConnector(BaseConnector):
                         field="externalRecordId",
                         values=[r.external_record_id for r in records if r.external_record_id],
                     )
-                opp_stored = {
-                    node.get("externalRecordId"): node
+                opp_existing_ext_ids = {
+                    node.get("externalRecordId")
                     for node in (opp_existing_nodes or [])
                     if node.get("externalRecordId") and node.get("connectorId") == self.connector_id
                 }
-                new_opp_records = [r for r in records if r.external_record_id not in opp_stored]
-                update_opp_records = [
-                    r for r in records
-                    if r.external_record_id in opp_stored and not self._unchanged(opp_stored[r.external_record_id], r)
-                ]
-                self._note_written(records)
-                self._note_moves(opp_stored, records)
+                new_opp_records = [r for r in records if r.external_record_id not in opp_existing_ext_ids]
+                update_opp_records = [r for r in records if r.external_record_id in opp_existing_ext_ids]
 
                 if new_opp_records:
                     await self.data_entities_processor.on_new_records(
@@ -5495,9 +5658,7 @@ class SalesforceConnector(BaseConnector):
                     r.external_record_id for r in new_opp_records if r.external_record_id
                 )
 
-                async def write_deal_info(
-                    tx_store: TransactionStore, opportunity_with_edges: list[tuple[Record, dict]]
-                ) -> None:
+                async with self.data_store_provider.transaction() as tx_store:
                     existing_records_list = await asyncio.gather(*[
                         tx_store.get_record_by_external_id(
                             connector_id=record.connector_id,
@@ -5542,8 +5703,6 @@ class SalesforceConnector(BaseConnector):
                         await tx_store.batch_create_edges(
                             deal_info_edges, collection=CollectionNames.DEAL_INFO.value,
                         )
-
-                await self.data_store_provider.execute_in_transaction(write_deal_info, opportunity_with_edges)
 
                 total += len(records)
                 total_new += len(new_opp_records)
@@ -5728,7 +5887,7 @@ class SalesforceConnector(BaseConnector):
                 final_sold_in_items.append((deal_internal_id, edges_list))
 
             if final_sold_in_items:
-                async def write_sold_in(tx_store: TransactionStore) -> None:
+                async with self.data_store_provider.transaction() as tx_store:
                     delete_tasks = [
                         tx_store.delete_edge(
                             from_id=edge.from_id,
@@ -5754,8 +5913,6 @@ class SalesforceConnector(BaseConnector):
                             all_sold_in_edges,
                             collection=CollectionNames.SOLD_IN.value,
                         )
-
-                await self.data_store_provider.execute_in_transaction(write_sold_in)
 
             self.logger.info(
                 "Synced soldIn edges for %d unique deals (total %d edges)",
@@ -5789,12 +5946,12 @@ class SalesforceConnector(BaseConnector):
                             continue
                         record = self._build_case_record(case_row)
                         if self.indexing_filters and self.indexing_filters.is_enabled(
-                            IndexingFilterKey.ENABLE_MANUAL_SYNC, default=False,
+                            IndexingFilterKey.ENABLE_MANUAL_SYNC,
                         ):
                             record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
                         records.append(record)
                     except Exception as e:
-                        self._skip_record("case", case_row.Id, e)
+                        self.logger.warning(f"Failed to process case {case_row.Id}: {e}")
                         continue
 
                 if not records:
@@ -5806,18 +5963,13 @@ class SalesforceConnector(BaseConnector):
                         field="externalRecordId",
                         values=[r.external_record_id for r in records if r.external_record_id],
                     )
-                case_stored = {
-                    node.get("externalRecordId"): node
+                case_existing_ext_ids = {
+                    node.get("externalRecordId")
                     for node in (case_existing_nodes or [])
                     if node.get("externalRecordId") and node.get("connectorId") == self.connector_id
                 }
-                new_case_records = [r for r in records if r.external_record_id not in case_stored]
-                update_case_records = [
-                    r for r in records
-                    if r.external_record_id in case_stored and not self._unchanged(case_stored[r.external_record_id], r)
-                ]
-                self._note_written(records)
-                self._note_moves(case_stored, records)
+                new_case_records = [r for r in records if r.external_record_id not in case_existing_ext_ids]
+                update_case_records = [r for r in records if r.external_record_id in case_existing_ext_ids]
                 if new_case_records:
                     await self.data_entities_processor.on_new_records(
                         [(r, []) for r in new_case_records],
@@ -5933,11 +6085,11 @@ class SalesforceConnector(BaseConnector):
                         _flags = await asyncio.gather(*[_has_belongs_to_edge(n) for n in _batch])
                         synced_nodes.extend(n for n, ok in zip(_batch, _flags) if ok)
 
-                synced_external_ids: set[str] = self._in_run_scope({
+                synced_external_ids: set[str] = {
                     node["externalRecordId"]
                     for node in synced_nodes
                     if node.get("externalRecordId")
-                })
+                }
                 synced_account_ids: set[str] = {
                     node["externalGroupId"]
                     for node in (account_group_nodes or [])
@@ -5996,12 +6148,12 @@ class SalesforceConnector(BaseConnector):
                             continue
                         record = self._build_task_record(task_row, opp_account_map, case_account_map)
                         if self.indexing_filters and self.indexing_filters.is_enabled(
-                            IndexingFilterKey.ENABLE_MANUAL_SYNC, default=False,
+                            IndexingFilterKey.ENABLE_MANUAL_SYNC,
                         ):
                             record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
                         records.append(record)
                     except Exception as e:
-                        self._skip_record("task", task_row.Id, e)
+                        self.logger.warning(f"Failed to process task {task_row.Id}: {e}")
                         continue
 
                 if not records:
@@ -6024,13 +6176,7 @@ class SalesforceConnector(BaseConnector):
                     if node.get("externalRecordId") and node.get("connectorId") == self.connector_id
                 }
                 new_task_records = [r for r in records if r.external_record_id not in task_existing_by_ext_id]
-                update_task_records = [
-                    r for r in records
-                    if r.external_record_id in task_existing_by_ext_id
-                    and not self._unchanged(task_existing_by_ext_id[r.external_record_id], r)
-                ]
-                self._note_written(records)
-                self._note_moves(task_existing_by_ext_id, records)
+                update_task_records = [r for r in records if r.external_record_id in task_existing_by_ext_id]
 
                 if new_task_records:
                     await self.data_entities_processor.on_new_records(
@@ -6043,14 +6189,12 @@ class SalesforceConnector(BaseConnector):
                     if existing_internal_id:
                         record.id = existing_internal_id
                     if existing_rg_ext_id and existing_rg_ext_id != record.external_record_group_id:
-                        await self.data_store_provider.execute_in_transaction(
-                            lambda tx_store, record_id: tx_store.delete_edges_from(
-                                record_id,
+                        async with self.data_store_provider.transaction() as tx_store:
+                            await tx_store.delete_edges_from(
+                                record.id,
                                 CollectionNames.RECORDS.value,
                                 CollectionNames.BELONGS_TO.value,
-                            ),
-                            record.id,
-                        )
+                            )
                     await self.data_entities_processor.on_record_content_update(record)
 
                 total += len(records)
@@ -6148,9 +6292,9 @@ class SalesforceConnector(BaseConnector):
                 connector_id=self.connector_id,
                 is_internal=True,
             )
-            # No audience of its own: a file is read by whoever reads the record it is
-            # attached to. [] clears the org-wide READ older versions gave this group.
-            await self.data_entities_processor.on_new_record_groups([(files_record_group, [])])
+            await self.data_entities_processor.on_new_record_groups([
+                (files_record_group, [Permission(entity_type=EntityType.ORG, type=PermissionType.READ)])
+            ])
 
             org_id = self.data_entities_processor.org_id
             total_new = 0
@@ -6293,14 +6437,6 @@ class SalesforceConnector(BaseConnector):
                     for node in _synced_nodes
                     if node.get("externalRecordId") and node.get("connectorId") == self.connector_id
                 }
-                synced_external_ids = self._in_run_scope(synced_external_ids)
-                # A file is filed in its parent's record group, so that it takes its audience
-                # from the parent record (a parent in another group lends it none).
-                parent_group_by_ext: dict[str, Optional[str]] = {
-                    node["externalRecordId"]: node.get("externalGroupId")
-                    for node in _synced_nodes
-                    if node.get("externalRecordId")
-                }
                 synced_account_ids: Set[str] = {
                     node["externalGroupId"]
                     for node in (_account_group_nodes or [])
@@ -6336,11 +6472,7 @@ class SalesforceConnector(BaseConnector):
                             external_record_group_id = linked_entity_id
                         else:
                             parent_id = linked_entity_id
-                            # Without a stored group the file stays in the files group, which
-                            # has no audience: nobody reads it rather than everybody.
-                            external_record_group_id = (
-                                parent_group_by_ext.get(linked_entity_id) or f"{org_id}-files"
-                            )
+                            external_record_group_id = f"{org_id}-files"
                             file_parent_record_type = _LINKED_TYPE_TO_RECORD_TYPE.get(linked_entity_type)
 
                         external_record_id = f"{doc_id}-{linked_entity_id}"
@@ -6358,19 +6490,18 @@ class SalesforceConnector(BaseConnector):
                         meta, doc_id,
                         external_record_group_id=f"{org_id}-files",
                     )
+                    if self.indexing_filters and self.indexing_filters.is_enabled(
+                        IndexingFilterKey.ENABLE_MANUAL_SYNC,
+                    ):
+                        rec.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
                     if rec:
                         all_records.append((rec, doc_id))
 
-                manual_indexing = bool(self.indexing_filters and self.indexing_filters.is_enabled(
-                    IndexingFilterKey.ENABLE_MANUAL_SYNC, default=False,
-                ))
                 new_records_batch: List[Tuple[FileRecord, List[Permission]]] = []
                 page_updated = 0
                 for rec, ext_id in all_records:
                     if not rec:
                         continue
-                    if manual_indexing:
-                        rec.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
                     existing = await self.data_entities_processor.get_record_by_external_id(
                         self.connector_id, ext_id,
                     )
@@ -6386,9 +6517,6 @@ class SalesforceConnector(BaseConnector):
                         or getattr(existing, "size_in_bytes", None) != rec.size_in_bytes
                         or getattr(existing, "mime_type", None) != rec.mime_type
                         or getattr(existing, "weburl", None) != rec.weburl
-                        # Moved to another record or record group: its audience changed.
-                        or getattr(existing, "external_record_group_id", None) != rec.external_record_group_id
-                        or getattr(existing, "parent_external_record_id", None) != rec.parent_external_record_id
                     )
                     if not metadata_changed:
                         # The lookup above returns a base Record, which has no extension. If the file
@@ -6399,33 +6527,21 @@ class SalesforceConnector(BaseConnector):
                             self.logger.warning(f"Updating {ext_id}: its stored file record could not be read: {read_error}")
                             existing_file = None
                         metadata_changed = existing_file is None or existing_file.extension != rec.extension
-                    # Stored while manual indexing was on, which is now off: index it, as a
-                    # full sync does for the other record types.
-                    held_back = (
-                        not manual_indexing
-                        and getattr(existing, "indexing_status", None) == ProgressStatus.AUTO_INDEX_OFF.value
-                    )
-                    if content_changed or metadata_changed or held_back:
+                    if content_changed or metadata_changed:
                         rec.id = existing.id
-                        rec.version = getattr(existing, "version", 0) + (1 if content_changed or metadata_changed else 0)
+                        rec.version = getattr(existing, "version", 0) + 1
                         record_update = RecordUpdate(
                             record=rec,
                             is_new=False,
                             is_updated=True,
                             is_deleted=False,
                             metadata_changed=metadata_changed,
-                            content_changed=content_changed or held_back,
+                            content_changed=content_changed,
                             permissions_changed=False,
                             external_record_id=ext_id,
                         )
                         await self._handle_record_updates(record_update)
                         page_updated += 1
-                    elif self._full_run_parents is not None:
-                        # A full sync unlinks every node it did not write once it ends, so an
-                        # unchanged file is written again: its links only, indexing left as is.
-                        rec.id = existing.id
-                        rec.version = getattr(existing, "version", 0)
-                        await self.data_entities_processor.on_record_metadata_update(rec)
 
                 for i in range(0, len(new_records_batch), 100):
                     await self.data_entities_processor.on_new_records(
@@ -6449,51 +6565,29 @@ class SalesforceConnector(BaseConnector):
         1. Pre-fetch records, record-groups, and DB users in one transaction.
         2. Collect (user, record, access_level) tuples from Salesforce concurrently
            (API calls only — no DB writes during collection).
-        3. Replace the permission edges of every record and record group whose access
-           was read for every user; a record some user's read failed for keeps its
-           stored edges and only gains the fresh ones (unknown is not empty).
-
-        Products are not shared record by record: the product group's readers are the
-        users whose permission sets grant Read on Product2 (``_sync_product_readers``).
+        3. Replace all stale permission edges with fresh ones in a single batch
+           transaction: O(records + groups) deletes + 2 batch_create_edges calls.
+           Only when every user's access was read in full: if any read failed, the
+           stored edges are kept and the fresh ones are added (unknown is not empty).
         """
-        # 1. Users who can sign in: active and not frozen.
+        # 1. Fetch all active Salesforce users (streamed; bounded by user count
+        #    which is the natural cardinality of this query — capping pages here
+        #    has no further benefit).
         soql_query = "SELECT Id, Email FROM User WHERE IsActive = true"
         sf_users: List[Dict[str, str]] = []
         async for page in self._soql_query_paginated(api_version=api_version, q=soql_query):
             for u in page:
                 if u.get("Id") and u.get("Email"):
                     sf_users.append(u)
-        eligibility = self._eligibility(api_version)
-        frozen = await eligibility.frozen_user_ids()
-        if frozen:
-            sf_users = [u for u in sf_users if u.get("Id") not in frozen]
 
         # 2. Fetch records, record groups, and matching DB users in one transaction
-        org_id = self.data_entities_processor.org_id
         async with self.data_store_provider.transaction() as tx_store:
             salesforce_records = await tx_store.get_nodes_by_field_in(
                 collection=CollectionNames.RECORDS.value,
                 field="recordType",
                 values=[RecordType.DEAL.value, RecordType.TASK.value, RecordType.CASE.value, RecordType.PRODUCT.value],
             )
-            # A record in the trash is gone from Salesforce: asking about it can fail the read.
-            salesforce_records = [
-                r for r in salesforce_records
-                if r.get("connectorId") == self.connector_id and not r.get("isDeleted")
-            ]
-            # Products take their readers from the product group; per-user edges older
-            # versions wrote to them are removed and not written again.
-            product_record_ids = [
-                (r.get("id") or r.get("_key")) for r in salesforce_records
-                if r.get("recordType") == RecordType.PRODUCT.value and (r.get("id") or r.get("_key"))
-            ]
-            salesforce_records = [r for r in salesforce_records if r.get("recordType") != RecordType.PRODUCT.value]
-            # A record the last full sync no longer saw (outside the sync filters) was unlinked
-            # from the hierarchy. Granting it here would make it readable again on the next
-            # incremental sync, so only records still in the hierarchy get readers.
-            linked = set(await tx_store.filter_linked_record_ids(
-                [rid for rid in ((r.get("id") or r.get("_key")) for r in salesforce_records) if rid]))
-            salesforce_records = [r for r in salesforce_records if (r.get("id") or r.get("_key")) in linked]
+            salesforce_records = [r for r in salesforce_records if r.get("connectorId") == self.connector_id]
 
             salesforce_record_groups = await tx_store.get_nodes_by_field_in(
                 collection=CollectionNames.RECORD_GROUPS.value,
@@ -6502,13 +6596,12 @@ class SalesforceConnector(BaseConnector):
             )
             salesforce_record_groups = [r for r in salesforce_record_groups if r.get("connectorId") == self.connector_id]
 
-            # PipesHub users of this org whose email matches a Salesforce user. Salesforce
-            # emails are case-insensitive; a user of another PipesHub org is never matched.
-            emails = {u["Email"] for u in sf_users} | {u["Email"].lower() for u in sf_users}
+            # Pre-fetch all DB user nodes whose email matches a Salesforce user
+            sf_user_emails = [u.get("Email") for u in sf_users]
             db_users = await tx_store.get_nodes_by_field_in(
                 collection=CollectionNames.USERS.value,
                 field="email",
-                values=sorted(emails),
+                values=sf_user_emails,
             )
 
         # 3. Build O(1) lookup maps to avoid per-record DB round-trips
@@ -6524,20 +6617,16 @@ class SalesforceConnector(BaseConnector):
             if r.get("externalGroupId") and (r.get("id") or r.get("_key"))
         }
         email_to_user_id: Dict[str, str] = {
-            u.get("email").lower(): (u.get("id") or u.get("_key"))
+            u.get("email"): (u.get("id") or u.get("_key"))
             for u in (db_users or [])
             if u.get("email") and (u.get("id") or u.get("_key"))
-            and u.get("orgId") == (parent_org_id or org_id)
+            and (parent_org_id is None or u.get("orgId") == parent_org_id)
         }
-        # Only Salesforce users with a PipesHub account get edges, so only they are read.
-        sf_users = [u for u in sf_users if u["Email"].lower() in email_to_user_id]
-
-        await self._sync_product_readers(eligibility, sf_users)
 
         salesforce_external_ids = list(ext_id_to_record_id.keys())
         salesforce_rg_external_ids = list(ext_id_to_rg_id.keys())
 
-        if not salesforce_external_ids and not salesforce_rg_external_ids:
+        if not salesforce_external_ids:
             self.logger.info("No Salesforce records found to sync permissions for.")
             return
 
@@ -6550,8 +6639,7 @@ class SalesforceConnector(BaseConnector):
         MAX_CONCURRENT_USERS = 5
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_USERS)
 
-        # Users (lower-cased emails) some of whose access could not be read this run.
-        unknown_users: set = set()
+        incomplete_users: set = set()
         tasks = [
             self._sync_permissions_for_user(
                 user=user,
@@ -6559,7 +6647,7 @@ class SalesforceConnector(BaseConnector):
                 salesforce_record_group_external_ids=salesforce_rg_external_ids,
                 api_version=api_version,
                 semaphore=semaphore,
-                incomplete=unknown_users,
+                incomplete=incomplete_users,
             )
             for user in sf_users
         ]
@@ -6571,173 +6659,123 @@ class SalesforceConnector(BaseConnector):
                     "Failed to collect permissions for user %s: %s",
                     sf_users[i].get("Email"), result,
                 )
-                unknown_users.add(sf_users[i]["Email"].lower())
+                incomplete_users.add(sf_users[i].get("Email"))
             else:
                 all_permission_tuples.extend(result)  # type: ignore[arg-type]
 
         self.logger.info("Collected %d permission tuples total.", len(all_permission_tuples))
 
-        # 5. One transaction: rewrite the permission edges of every record and record group
-        #    from this read. A user whose read was incomplete keeps their stored edges to
-        #    them (unknown is not empty); everyone else's revocations apply now.
-        #    SALESFORCE_ORG record groups carry no ORG-level permission edges, so wiping all
-        #    PERMISSION edges to them is safe.
+        # 5. Single batch transaction: delete stale edges then create fresh ones.
+        #    Deleting by target record/group (not by user) is O(records + groups) instead
+        #    of O(users × records).  SALESFORCE_ORG record groups carry no ORG-level
+        #    permission edges, so wiping all PERMISSION edges to them is safe.
         delete_targets = [
             (rid, CollectionNames.RECORDS.value) for rid in ext_id_to_record_id.values()
         ] + [
             (rgid, CollectionNames.RECORD_GROUPS.value) for rgid in ext_id_to_rg_id.values()
-        ] + [
-            (pid, CollectionNames.RECORDS.value) for pid in product_record_ids
         ]
-        if unknown_users:
+        if incomplete_users:
+            # The edges are rebuilt from scratch, so a user whose read failed would lose
+            # all access. Add-only this run; access that was revoked stays until a pass
+            # in which every user is read in full.
             self.logger.warning(
-                "Access of %d user(s) could not be read in full; they keep their stored "
-                "permission edges until a later sync reads them in full.",
-                len(unknown_users),
+                "Access of %d user(s) could not be read in full; keeping stored permission "
+                "edges and only adding (revocations wait for a complete pass).",
+                len(incomplete_users),
             )
-            self._problems.note(ACCESS_KEPT)
+            delete_targets = []
         org_by_node_id: dict[str, str | None] = {
             (n.get("id") or n.get("_key")): n.get("orgId")
             for n in salesforce_records + salesforce_record_groups
         }
         narrowed_orgs: set[str | None] = set()
-        record_edges: list[dict] = []
-        rg_edges: list[dict] = []
+        # One giant Neo4j txn for ~tens of thousands of records × hundreds of users
+        # blows dbms.memory.transaction.total.max (MemoryPoolOutOfMemoryError).
+        # Commit deletes and creates in small batches instead.
+        DELETE_BATCH_SIZE = 200
+        EDGE_BATCH_SIZE = 1000
+        record_edges: List[Dict] = []
+        rg_edges: List[Dict] = []
         try:
-            async def write_permissions(tx_store: TransactionStore) -> tuple[list[dict], list[dict]]:
-                # Fresh each attempt: a re-run after a deadlock must not write them twice.
-                record_edges: list[dict] = []
-                rg_edges: list[dict] = []
-                kept_edges = await self._stored_edges_of(
-                    tx_store, unknown_users, email_to_user_id,
-                    set(ext_id_to_record_id.values()), set(ext_id_to_rg_id.values()),
-                )
-                for node_id, collection in delete_targets:
-                    if await tx_store.delete_edges_to(
-                        node_id, collection, CollectionNames.PERMISSION.value
-                    ):
-                        narrowed_orgs.add(org_by_node_id.get(node_id))
+            for batch_start in range(0, len(delete_targets), DELETE_BATCH_SIZE):
+                batch = delete_targets[batch_start:batch_start + DELETE_BATCH_SIZE]
+                async with self.data_store_provider.transaction() as tx_store:
+                    for node_id, collection in batch:
+                        if await tx_store.delete_edges_to(
+                            node_id, collection, CollectionNames.PERMISSION.value
+                        ):
+                            narrowed_orgs.add(org_by_node_id.get(node_id))
+                if batch_start and batch_start % (DELETE_BATCH_SIZE * 10) == 0:
+                    self.logger.info(
+                        "Permission delete progress: %d/%d targets",
+                        min(batch_start + DELETE_BATCH_SIZE, len(delete_targets)),
+                        len(delete_targets),
+                    )
 
-                for email, ext_id, access_level, is_group in all_permission_tuples:
-                    user_internal_id = email_to_user_id.get((email or "").lower())
-                    if not user_internal_id:
-                        self.logger.debug("Skipping permission: no DB user for email %s", email)
+            for email, ext_id, access_level, is_group in all_permission_tuples:
+                user_internal_id = email_to_user_id.get(email)
+                if not user_internal_id:
+                    self.logger.debug("Skipping permission: no DB user for email %s", email)
+                    continue
+                try:
+                    perm_type = PermissionType(access_level)
+                except ValueError:
+                    self.logger.warning(
+                        "Unknown access level %r for user %s, skipping", access_level, email
+                    )
+                    continue
+
+                permission = Permission(email=email, type=perm_type, entity_type=EntityType.USER)
+                if is_group:
+                    target_id = ext_id_to_rg_id.get(ext_id)
+                    if not target_id:
                         continue
-                    try:
-                        perm_type = PermissionType(access_level)
-                    except ValueError:
-                        self.logger.warning(
-                            "Unknown access level %r for user %s, skipping", access_level, email
+                    rg_edges.append(permission.to_arango_permission(
+                        from_id=user_internal_id,
+                        from_collection=CollectionNames.USERS.value,
+                        to_id=target_id,
+                        to_collection=CollectionNames.RECORD_GROUPS.value,
+                    ))
+                else:
+                    target_id = ext_id_to_record_id.get(ext_id)
+                    if not target_id:
+                        continue
+                    record_edges.append(permission.to_arango_permission(
+                        from_id=user_internal_id,
+                        from_collection=CollectionNames.USERS.value,
+                        to_id=target_id,
+                        to_collection=CollectionNames.RECORDS.value,
+                    ))
+
+            async def _write_edge_batches(edges: List[Dict], label: str) -> None:
+                total = len(edges)
+                for i in range(0, total, EDGE_BATCH_SIZE):
+                    chunk = edges[i:i + EDGE_BATCH_SIZE]
+                    async with self.data_store_provider.transaction() as tx_store:
+                        await tx_store.batch_create_edges(
+                            chunk, collection=CollectionNames.PERMISSION.value,
                         )
-                        continue
+                    if i and i % (EDGE_BATCH_SIZE * 10) == 0:
+                        self.logger.info(
+                            "Permission %s create progress: %d/%d edges",
+                            label, min(i + EDGE_BATCH_SIZE, total), total,
+                        )
 
-                    permission = Permission(email=email, type=perm_type, entity_type=EntityType.USER)
-                    if is_group:
-                        target_id = ext_id_to_rg_id.get(ext_id)
-                        if not target_id:
-                            continue
-                        rg_edges.append(permission.to_arango_permission(
-                            from_id=user_internal_id,
-                            from_collection=CollectionNames.USERS.value,
-                            to_id=target_id,
-                            to_collection=CollectionNames.RECORD_GROUPS.value,
-                        ))
-                    else:
-                        target_id = ext_id_to_record_id.get(ext_id)
-                        if not target_id:
-                            continue
-                        record_edges.append(permission.to_arango_permission(
-                            from_id=user_internal_id,
-                            from_collection=CollectionNames.USERS.value,
-                            to_id=target_id,
-                            to_collection=CollectionNames.RECORDS.value,
-                        ))
-
-                if kept_edges:
-                    await tx_store.batch_create_edges(kept_edges, collection=CollectionNames.PERMISSION.value)
-                if record_edges:
-                    await tx_store.batch_create_edges(record_edges, collection=CollectionNames.PERMISSION.value)
-                if rg_edges:
-                    await tx_store.batch_create_edges(rg_edges, collection=CollectionNames.PERMISSION.value)
-                return record_edges, rg_edges
-
-            record_edges, rg_edges = await self.data_store_provider.execute_in_transaction(write_permissions)
+            if record_edges:
+                await _write_edge_batches(record_edges, "record")
+            if rg_edges:
+                await _write_edge_batches(rg_edges, "record-group")
         finally:
             # Even when the write raised: on Neo4j without explicit transactions each
             # delete commits on its own, and a rerun finds nothing left to delete.
             fallback_org = self.data_entities_processor.org_id or None
-            for changed_org in {org or fallback_org for org in narrowed_orgs}:
-                await notify_connector_permissions_changed(self.connector_id, changed_org)
+            for org_id in {org or fallback_org for org in narrowed_orgs}:
+                await notify_connector_permissions_changed(self.connector_id, org_id)
 
         self.logger.info(
             "Permission sync complete: %d record edges and %d record group edges written.",
             len(record_edges), len(rg_edges),
         )
-
-    @staticmethod
-    async def _stored_edges_of(
-        tx_store: TransactionStore,
-        unknown_users: set,
-        email_to_user_id: dict[str, str],
-        record_ids: set[str],
-        group_ids: set[str],
-    ) -> list[dict]:
-        """The stored permission edges of ``unknown_users`` to this connector's records and
-        record groups, rebuilt to be written back after the rewrite."""
-        kept: list[dict] = []
-        for email in unknown_users:
-            user_id = email_to_user_id.get(email)
-            if not user_id:
-                continue
-            # A read that fails must abort the rewrite: an empty answer would drop their edges.
-            edges = await tx_store.get_edges_from_node_with_target_name(
-                f"{CollectionNames.USERS.value}/{user_id}", CollectionNames.PERMISSION.value,
-                raise_on_error=True,
-            )
-            for edge in edges or []:
-                target = str(edge.get("_to") or edge.get("to") or "")
-                collection, _, key = target.partition("/")
-                if collection == CollectionNames.RECORDS.value and key in record_ids:
-                    pass
-                elif collection == CollectionNames.RECORD_GROUPS.value and key in group_ids:
-                    pass
-                else:
-                    continue
-                try:
-                    perm_type = PermissionType(edge.get("role"))
-                except ValueError:
-                    continue
-                kept.append(Permission(email=email, type=perm_type, entity_type=EntityType.USER).to_arango_permission(
-                    from_id=user_id,
-                    from_collection=CollectionNames.USERS.value,
-                    to_id=key,
-                    to_collection=collection,
-                ))
-        return kept
-
-    def _product_record_group(self) -> RecordGroup:
-        return RecordGroup(
-            name="Products",
-            external_group_id=self.data_entities_processor.org_id + "-product",
-            group_type=RecordGroupType.PRODUCT,
-            connector_name=self.connector_name,
-            connector_id=self.connector_id,
-        )
-
-    async def _sync_product_readers(
-        self, eligibility: SalesforceEligibility, sf_users: list[dict[str, str]],
-    ) -> None:
-        """Grant the product group to the users who may read Product2 in Salesforce: an
-        exact list that replaces the stored one. When it cannot be read, the stored
-        grants stay."""
-        readers = await eligibility.product_reader_ids()
-        if readers is None:
-            return
-        permissions = [
-            Permission(email=u["Email"], type=PermissionType.READ, entity_type=EntityType.USER)
-            for u in sf_users if u.get("Id") in readers
-        ]
-        await self.data_entities_processor.on_new_record_groups([(self._product_record_group(), permissions)])
 
     async def _sync_permissions_for_user(
         self,
@@ -6760,14 +6798,13 @@ class SalesforceConnector(BaseConnector):
             return []
 
         collected: List[Tuple[str, str, str, bool]] = []
-        unread: set = set()
         async with semaphore:
             async for rec_id, email, access_level in self._iter_record_access(
                 user_id=user_id,
                 user_email=user_email,
                 record_ids=salesforce_external_ids,
                 api_version=api_version,
-                incomplete=unread,
+                incomplete=incomplete,
             ):
                 collected.append((email, rec_id, access_level, False))
 
@@ -6776,12 +6813,10 @@ class SalesforceConnector(BaseConnector):
                 user_email=user_email,
                 record_ids=salesforce_record_group_external_ids,
                 api_version=api_version,
-                incomplete=unread,
+                incomplete=incomplete,
             ):
                 collected.append((email, rg_id, access_level, True))
 
-        if unread and incomplete is not None:
-            incomplete.add(user_email.lower())
         return collected
 
     async def salesforce_record_group_permissions_sync(
@@ -6933,8 +6968,11 @@ class SalesforceConnector(BaseConnector):
                     group_id = group.get("Id")
                     if not group_id:
                         continue
-                    members = await self._complete_child_list(group.get("GroupMembers"))
-                    records = (members or {}).get("records", [])
+                    # "GroupMembers" is present but null for groups Salesforce will
+                    # not expand (no members, or the child relationship is not
+                    # readable). A {} default does not cover that, so coerce to {}.
+                    group_members = group.get("GroupMembers") or {}
+                    records = group_members.get("records") or []
                     member_ids: List[str] = []
                     for member in records:
                         user_or_group_id = member.get("UserOrGroupId")
@@ -6985,9 +7023,14 @@ class SalesforceConnector(BaseConnector):
         first call after a connector install (or a sync-point reset) therefore
         performs a full bootstrap; subsequent scheduled calls are lightweight.
         """
-        self.logger.info("Starting Salesforce incremental sync.")
-        await self.run_sync()  # logs and reports its own failure
-        self.logger.info("Salesforce incremental sync completed.")
+        try:
+            self.logger.info("Starting Salesforce incremental sync.")
+            await self.run_sync()
+            self.logger.info("Salesforce incremental sync completed.")
+
+        except Exception as ex:
+            self.logger.error(f"Error in Salesforce incremental sync: {ex}", exc_info=True)
+            raise
 
     def handle_webhook_notification(self, notification: Dict) -> None:
         """
@@ -7049,17 +7092,6 @@ class SalesforceConnector(BaseConnector):
                 )
 
                 if updated_record:
-                    # A reindex refreshes what the record says. Its record group, which decides who
-                    # reads it, is the sync's, read with its parent (a task's account, a file's
-                    # record); so is a file's parent, which this one-row rebuild does not know.
-                    if record.external_record_group_id:
-                        updated_record.external_record_group_id = record.external_record_group_id
-                    if not updated_record.parent_external_record_id and record.parent_external_record_id:
-                        parent = await self.data_entities_processor.get_record_by_external_id(
-                            self.connector_id, record.parent_external_record_id,
-                        )
-                        updated_record.parent_external_record_id = record.parent_external_record_id
-                        updated_record.parent_record_type = parent.record_type if parent else None
                     await self.data_entities_processor.on_record_content_update(updated_record)
                 else:
                     to_reindex.append(record)
