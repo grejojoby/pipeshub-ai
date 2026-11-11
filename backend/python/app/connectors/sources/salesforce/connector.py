@@ -2220,11 +2220,8 @@ class SalesforceConnector(BaseConnector):
                 content_bytes = await self._process_case_record(record)
             elif record.record_type == RecordType.TASK:
                 content_bytes = await self._process_task_record(record)
-            elif record.record_type in (RecordType.OTHERS, RecordType.WEBPAGE) and (
-                (record.external_record_group_id or "").startswith(_CUSTOM_OBJECT_GROUP_PREFIX)
-            ):
-                content_bytes = await self._process_custom_object_record(record)
-            elif record.record_type == RecordType.OTHERS:
+            elif record.record_type in (RecordType.OTHERS, RecordType.WEBPAGE):
+                # Custom __c rows are WEBPAGE; group id may be absent on stream reconstruct.
                 content_bytes = await self._process_custom_object_record(record)
             else:
                 raise HTTPException(
