@@ -79,6 +79,7 @@ from app.models.entities import (
     RecordGroupType,
     RecordType,
     TicketRecord,
+    WebpageRecord,
 )
 from collections import defaultdict
 
@@ -2219,6 +2220,10 @@ class SalesforceConnector(BaseConnector):
                 content_bytes = await self._process_case_record(record)
             elif record.record_type == RecordType.TASK:
                 content_bytes = await self._process_task_record(record)
+            elif record.record_type in (RecordType.OTHERS, RecordType.WEBPAGE) and (
+                (record.external_record_group_id or "").startswith(_CUSTOM_OBJECT_GROUP_PREFIX)
+            ):
+                content_bytes = await self._process_custom_object_record(record)
             elif record.record_type == RecordType.OTHERS:
                 content_bytes = await self._process_custom_object_record(record)
             else:
@@ -2774,9 +2779,11 @@ class SalesforceConnector(BaseConnector):
             except Exception:
                 pass
         revision = row.get("SystemModstamp") or row.get("LastModifiedDate")
-        return Record(
+        # WebpageRecord implements to_kafka_record(); bare Record raises NotImplementedError
+        # during on_new_records indexing enqueue.
+        return WebpageRecord(
             record_name=record_name[:500] if record_name else f"{api_name} {record_id}",
-            record_type=RecordType.OTHERS,
+            record_type=RecordType.WEBPAGE,
             record_group_type=RecordGroupType.SALESFORCE_ORG,
             external_record_id=record_id,
             external_record_group_id=f"{_CUSTOM_OBJECT_GROUP_PREFIX}{api_name}",
