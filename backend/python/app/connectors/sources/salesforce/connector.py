@@ -555,6 +555,141 @@ FILES_SYNC_POINT_KEY = "files"
 ACCOUNTS_SYNC_POINT_KEY = "accounts"
 DISCUSSIONS_SYNC_POINT_KEY = "discussions"
 
+
+# --------------- Custom Objects (Candidate ATS, etc.) ---------------
+
+_CUSTOM_OBJECT_EXCLUDED_SUFFIXES: Tuple[str, ...] = (
+    "__Share",
+    "__History",
+    "__Feed",
+    "__Tag",
+    "__ChangeEvent",
+    "__hd",
+    "__x",
+    "__b",
+    "__e",
+    "__mdt",
+    "__DataCategorySelection",
+    "__VoteStat",
+    "__ViewStat",
+    "__ka",
+    "__kav",
+    "__DataCategoryGroupSelection",
+)
+
+# Field types safe to SELECT as scalar values in SOQL and render as text.
+_CUSTOM_OBJECT_FIELD_TYPES: frozenset = frozenset({
+    "id", "string", "textarea", "email", "phone", "url", "picklist",
+    "multipicklist", "combobox", "boolean", "int", "double", "currency",
+    "percent", "date", "datetime", "time", "reference", "encryptedstring",
+})
+
+_CUSTOM_OBJECTS_SYNC_POINT_PREFIX = "custom_object:"
+_CUSTOM_OBJECT_GROUP_PREFIX = "sf-custom:"
+
+
+def _is_syncable_custom_sobject(meta: Dict[str, Any]) -> bool:
+    """Return True for queryable custom business objects (not history/share/etc.)."""
+    name = meta.get("name") or ""
+    if not meta.get("custom"):
+        return False
+    if not meta.get("queryable") or not meta.get("retrieveable"):
+        return False
+    if meta.get("deprecatedAndHidden"):
+        return False
+    for suffix in _CUSTOM_OBJECT_EXCLUDED_SUFFIXES:
+        if name.endswith(suffix):
+            return False
+    # Skip Salesforce platform / setup-ish custom objects that are never ATS data.
+    lower = name.lower()
+    if lower.startswith("apex") or "purposetxt" in lower:
+        return False
+    return True
+
+
+def _pick_custom_object_name_field(fields: List[Dict[str, Any]]) -> Optional[str]:
+    """Choose the best display-name field for a custom object row."""
+    by_name = {f.get("name"): f for f in fields if f.get("name")}
+    for candidate in ("Name", "Title__c", "Title", "Subject__c", "Subject", "Full_Name__c", "Candidate_Name__c"):
+        if candidate in by_name and by_name[candidate].get("type") in _CUSTOM_OBJECT_FIELD_TYPES:
+            return candidate
+    # nameField flag from describe
+    for f in fields:
+        if f.get("nameField") and f.get("name") and f.get("type") in _CUSTOM_OBJECT_FIELD_TYPES:
+            return f["name"]
+    return None
+
+
+def _select_custom_object_fields(fields: List[Dict[str, Any]], max_fields: int = 80) -> List[str]:
+    """Pick a bounded set of SOQL-safe fields for indexing custom object rows."""
+    selected: List[str] = []
+    required = ["Id"]
+    for name in ("CreatedDate", "LastModifiedDate", "SystemModstamp"):
+        if any(f.get("name") == name for f in fields):
+            required.append(name)
+    name_field = _pick_custom_object_name_field(fields)
+    if name_field and name_field not in required:
+        required.append(name_field)
+
+    for name in required:
+        if name not in selected:
+            selected.append(name)
+
+    # Prefer text-ish fields next, then other scalars.
+    textish = []
+    other = []
+    for f in fields:
+        fname = f.get("name")
+        ftype = (f.get("type") or "").lower()
+        if not fname or fname in selected:
+            continue
+        if not f.get("filterable", True) and ftype not in _CUSTOM_OBJECT_FIELD_TYPES:
+            continue
+        if ftype not in _CUSTOM_OBJECT_FIELD_TYPES:
+            continue
+        if f.get("calculated") and ftype not in {"string", "textarea", "double", "currency", "percent", "boolean", "int"}:
+            continue
+        bucket = textish if ftype in {"string", "textarea", "email", "phone", "url", "picklist", "multipicklist"} else other
+        bucket.append(fname)
+
+    for fname in textish + other:
+        if len(selected) >= max_fields:
+            break
+        selected.append(fname)
+    return selected
+
+
+def _format_custom_object_markdown(
+    api_name: str,
+    label: str,
+    row: Dict[str, Any],
+    name_field: Optional[str],
+) -> Tuple[str, str]:
+    """Return (record_name, markdown_body) for a custom object row."""
+    display = None
+    if name_field and row.get(name_field):
+        display = str(row.get(name_field))
+    if not display:
+        display = str(row.get("Name") or row.get("Id") or api_name)
+    lines = [f"# {display}", "", f"**Salesforce object:** {label} (`{api_name}`)", ""]
+    skip = {"attributes", "Id"}
+    for key, value in row.items():
+        if key in skip or value is None or value == "":
+            continue
+        if isinstance(value, dict):
+            # relationship stub — keep Name if present
+            nested_name = value.get("Name") or value.get("Id")
+            if nested_name:
+                lines.append(f"- **{key}:** {nested_name}")
+            continue
+        text = str(value)
+        if len(text) > 4000:
+            text = text[:4000] + "…"
+        lines.append(f"- **{key}:** {text}")
+    return display, "\n".join(lines)
+
+
+
 # Account SELECT fields that are core to every Salesforce org. Fields that exist in
 # only some orgs (Data.com's DunsNumber, FLS-restricted fields, managed-package
 # fields, or standard picklists hidden by profile) are appended at runtime only
@@ -2060,7 +2195,7 @@ class SalesforceConnector(BaseConnector):
         For FILE records: streams file bytes from Salesforce ContentVersion (like Dropbox),
         using create_stream_record_response with filename and mime_type.
 
-        For PRODUCT, DEAL, CASE, TASK: streams BlocksContainer JSON.
+        For PRODUCT, DEAL, CASE, TASK, OTHERS (custom objects): streams BlocksContainer JSON.
         """
 
         await self._reinitialize_token_if_needed()
@@ -2084,6 +2219,8 @@ class SalesforceConnector(BaseConnector):
                 content_bytes = await self._process_case_record(record)
             elif record.record_type == RecordType.TASK:
                 content_bytes = await self._process_task_record(record)
+            elif record.record_type == RecordType.OTHERS:
+                content_bytes = await self._process_custom_object_record(record)
             else:
                 raise HTTPException(
                     status_code=HttpStatusCode.BAD_REQUEST.value,
@@ -2582,6 +2719,265 @@ class SalesforceConnector(BaseConnector):
         user = user or {}
         await self.register_authenticated_source_user(user.get("Email"), user.get("Id"))
 
+
+    async def _list_custom_sobjects(self, api_version: str) -> List[Dict[str, Any]]:
+        """Discover syncable custom Salesforce objects via describe-global."""
+        if not self.data_source:
+            raise connector_not_ready(self.display_name)
+        response = await self.data_source.sobject_describe_global(api_version=api_version)
+        if not response.success:
+            self.logger.error(
+                "sobject_describe_global failed: status=%s error=%s",
+                response.status_code, response.error,
+            )
+            raise_for_stream_fetch(
+                success=False,
+                has_payload=False,
+                connector=self.display_name,
+                status=response.status_code,
+                message=self._soql_failure_message(response),
+            )
+        sobjects = list((response.data or {}).get("sobjects") or [])
+        selected = [m for m in sobjects if _is_syncable_custom_sobject(m)]
+        selected.sort(key=lambda m: (m.get("label") or m.get("name") or ""))
+        self.logger.info(
+            "Discovered %d syncable custom Salesforce objects (of %d total sobjects)",
+            len(selected), len(sobjects),
+        )
+        return selected
+
+    async def _describe_custom_sobject_fields(
+        self, api_version: str, api_name: str,
+    ) -> List[Dict[str, Any]]:
+        response = await self.data_source.sobject_describe(api_version=api_version, sobject=api_name)
+        if not response.success:
+            self.logger.warning(
+                "describe failed for %s: status=%s error=%s",
+                api_name, response.status_code, response.error,
+            )
+            return []
+        return list((response.data or {}).get("fields") or [])
+
+    def _build_custom_object_record(
+        self,
+        api_name: str,
+        label: str,
+        row: Dict[str, Any],
+        name_field: Optional[str],
+    ) -> Record:
+        record_id = row.get("Id")
+        record_name, _ = _format_custom_object_markdown(api_name, label, row, name_field)
+        weburl = None
+        if self.salesforce_instance_url and record_id:
+            try:
+                weburl = HttpUrl(f"{self.salesforce_instance_url}/{record_id}")
+            except Exception:
+                pass
+        revision = row.get("SystemModstamp") or row.get("LastModifiedDate")
+        return Record(
+            record_name=record_name[:500] if record_name else f"{api_name} {record_id}",
+            record_type=RecordType.OTHERS,
+            record_group_type=RecordGroupType.SALESFORCE_ORG,
+            external_record_id=record_id,
+            external_record_group_id=f"{_CUSTOM_OBJECT_GROUP_PREFIX}{api_name}",
+            external_revision_id=str(revision) if revision else None,
+            version=1,
+            origin=OriginTypes.CONNECTOR,
+            connector_name=self.connector_name,
+            connector_id=self.connector_id,
+            mime_type=MimeTypes.BLOCKS.value,
+            source_created_at=_parse_salesforce_timestamp(row.get("CreatedDate")),
+            source_updated_at=_parse_salesforce_timestamp(row.get("LastModifiedDate")),
+            inherit_permissions=False,
+            preview_renderable=False,
+            weburl=str(weburl) if weburl is not None else None,
+        )
+
+    async def _sync_one_custom_object(
+        self,
+        api_version: str,
+        meta: Dict[str, Any],
+    ) -> Tuple[int, int, int]:
+        """Sync one custom object. Returns (total, new, updated)."""
+        api_name = meta.get("name") or ""
+        label = meta.get("label") or api_name
+        if not api_name:
+            return 0, 0, 0
+
+        fields_meta = await self._describe_custom_sobject_fields(api_version, api_name)
+        if not fields_meta:
+            self.logger.warning("Skipping custom object %s: no describe fields", api_name)
+            return 0, 0, 0
+
+        select_fields = _select_custom_object_fields(fields_meta)
+        if "Id" not in select_fields:
+            self.logger.warning("Skipping custom object %s: no Id field", api_name)
+            return 0, 0, 0
+        name_field = _pick_custom_object_name_field(fields_meta)
+
+        org_permission = Permission(entity_type=EntityType.ORG, type=PermissionType.READ)
+        record_group = RecordGroup(
+            name=f"Salesforce · {label}",
+            external_group_id=f"{_CUSTOM_OBJECT_GROUP_PREFIX}{api_name}",
+            group_type=RecordGroupType.SALESFORCE_ORG,
+            connector_name=self.connector_name,
+            connector_id=self.connector_id,
+        )
+        await self.data_entities_processor.on_new_record_groups([(record_group, [org_permission])])
+
+        sync_key = f"{_CUSTOM_OBJECTS_SYNC_POINT_PREFIX}{api_name}"
+        sync_point = await self.records_sync_point.read_sync_point(sync_key)
+        last_ts_ms = sync_point.get("lastSyncTimestamp")
+
+        field_list = ", ".join(select_fields)
+        base_soql = f"SELECT {field_list} FROM {api_name}"
+        if last_ts_ms and any(f.get("name") == "LastModifiedDate" for f in fields_meta):
+            soql_datetime = epoch_ms_to_iso(last_ts_ms)
+            soql = f"{base_soql} WHERE LastModifiedDate >= {soql_datetime} ORDER BY LastModifiedDate ASC"
+        elif any(f.get("name") == "LastModifiedDate" for f in fields_meta):
+            soql = f"{base_soql} ORDER BY LastModifiedDate ASC"
+        else:
+            soql = f"{base_soql} ORDER BY Id ASC"
+
+        total = 0
+        total_new = 0
+        total_updated = 0
+        try:
+            async for page in self._soql_query_paginated(api_version=api_version, q=soql):
+                records: List[Record] = []
+                for row in page:
+                    try:
+                        if not row.get("Id"):
+                            continue
+                        record = self._build_custom_object_record(api_name, label, row, name_field)
+                        if self.indexing_filters and self.indexing_filters.is_enabled(
+                            IndexingFilterKey.ENABLE_MANUAL_SYNC,
+                        ):
+                            record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+                        records.append(record)
+                    except Exception as e:
+                        self.logger.warning(
+                            "Failed to process %s row %s: %s", api_name, row.get("Id"), e,
+                        )
+                        continue
+
+                if not records:
+                    continue
+
+                async with self.data_store_provider.transaction() as tx_store:
+                    existing_nodes = await tx_store.get_nodes_by_field_in(
+                        collection=CollectionNames.RECORDS.value,
+                        field="externalRecordId",
+                        values=[r.external_record_id for r in records if r.external_record_id],
+                    )
+                existing_ext_ids = {
+                    node.get("externalRecordId")
+                    for node in (existing_nodes or [])
+                    if node.get("externalRecordId") and node.get("connectorId") == self.connector_id
+                }
+                new_records = [r for r in records if r.external_record_id not in existing_ext_ids]
+                update_records = [r for r in records if r.external_record_id in existing_ext_ids]
+
+                if new_records:
+                    await self.data_entities_processor.on_new_records(
+                        [(r, []) for r in new_records],
+                    )
+                for record in update_records:
+                    await self.data_entities_processor.on_record_content_update(record)
+
+                total += len(records)
+                total_new += len(new_records)
+                total_updated += len(update_records)
+
+            await self.records_sync_point.update_sync_point(
+                sync_key,
+                {"lastSyncTimestamp": get_epoch_timestamp_in_ms()},
+            )
+            self.logger.info(
+                "Synced custom object %s (%s): %d rows (%d new, %d updated)",
+                api_name, label, total, total_new, total_updated,
+            )
+            return total, total_new, total_updated
+        except Exception as e:
+            self.logger.error("Error syncing custom object %s: %s", api_name, e, exc_info=True)
+            # Continue with other objects — one bad object must not abort the rest.
+            return total, total_new, total_updated
+
+    async def _sync_all_custom_objects(self, api_version: str) -> None:
+        """Discover and sync every queryable custom Salesforce object into searchable Records."""
+        self.logger.info("Syncing Salesforce custom objects (discover + index)...")
+        try:
+            custom_objects = await self._list_custom_sobjects(api_version)
+        except Exception as e:
+            self.logger.error("Custom object discovery failed: %s", e, exc_info=True)
+            return
+
+        grand_total = grand_new = grand_updated = 0
+        for meta in custom_objects:
+            t, n, u = await self._sync_one_custom_object(api_version, meta)
+            grand_total += t
+            grand_new += n
+            grand_updated += u
+
+        self.logger.info(
+            "Finished Salesforce custom objects: %d objects considered, %d rows synced (%d new, %d updated)",
+            len(custom_objects), grand_total, grand_new, grand_updated,
+        )
+
+    async def _process_custom_object_record(self, record: Record) -> bytes:
+        """Stream markdown content for a synced custom-object Record (RecordType.OTHERS)."""
+        if not self.data_source:
+            raise connector_not_ready(self.display_name)
+
+        group_id = record.external_record_group_id or ""
+        if not group_id.startswith(_CUSTOM_OBJECT_GROUP_PREFIX):
+            raise HTTPException(
+                status_code=HttpStatusCode.BAD_REQUEST.value,
+                detail=f"Unsupported custom record group: {group_id}",
+            )
+        api_name = group_id[len(_CUSTOM_OBJECT_GROUP_PREFIX):]
+        record_id = record.external_record_id
+        api_version = await self._get_api_version()
+
+        try:
+            safe_id = _sanitize_soql_id(record_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=HttpStatusCode.BAD_REQUEST.value,
+                detail="Invalid record ID",
+            )
+
+        fields_meta = await self._describe_custom_sobject_fields(api_version, api_name)
+        select_fields = _select_custom_object_fields(fields_meta) if fields_meta else ["Id"]
+        name_field = _pick_custom_object_name_field(fields_meta) if fields_meta else None
+        field_list = ", ".join(select_fields)
+        soql = f"SELECT {field_list} FROM {api_name} WHERE Id = '{safe_id}'"
+        row = await self._fetch_first_record(api_version=api_version, soql=soql)
+        if row is None:
+            raise not_found_at_source(self.display_name)
+
+        # Avoid a full describe-global on every stream; api_name is enough for indexing text.
+        label = api_name.replace("__c", "").replace("_", " ")
+
+        _, markdown = _format_custom_object_markdown(api_name, label, row, name_field)
+        weburl = record.weburl
+        block_group = BlockGroup(
+            id=str(uuid4()),
+            index=0,
+            name=record.record_name or label,
+            type=GroupType.TEXT_SECTION,
+            sub_type=GroupSubType.CONTENT,
+            description=f"Salesforce custom object {api_name}",
+            source_group_id=f"{record_id}_custom_fields",
+            data=markdown,
+            format=DataFormat.MARKDOWN,
+            weburl=str(weburl) if weburl else None,
+            requires_processing=True,
+        )
+        blocks_container = BlocksContainer(blocks=[], block_groups=[block_group])
+        return blocks_container.model_dump_json(indent=2).encode("utf-8")
+
+
     async def run_sync(self) -> None:
             """
             Runs a full synchronization from the Salesforce instance.
@@ -2767,6 +3163,10 @@ class SalesforceConnector(BaseConnector):
                     {"lastSyncTimestamp": get_epoch_timestamp_in_ms()},
                 )
 
+                # Step 6.5: Custom objects (Candidates and other __c objects) — run
+                # before Opportunities so a FeedItem/Opportunity failure cannot skip ATS data.
+                await self._sync_all_custom_objects(api_version)
+
                 # Step 7: Incremental sync for Products
                 # 7.1 Ensure product record group exists (org -> record group BELONGS_TO + org -> record group PERMISSION)
                 product_record_group = RecordGroup(
@@ -2823,11 +3223,18 @@ class SalesforceConnector(BaseConnector):
                     opp_pages = self._filter_pages_by_last_modified(
                         opp_pages, opp_case_updated_after_ms, opp_case_updated_before_ms,
                     )
-                newly_synced_opp_ids = await self._sync_opportunities(opp_pages)
-                await self.records_sync_point.update_sync_point(
-                    DEALS_SYNC_POINT_KEY,
-                    {"lastSyncTimestamp": get_epoch_timestamp_in_ms()},
-                )
+                try:
+                    newly_synced_opp_ids = await self._sync_opportunities(opp_pages)
+                    await self.records_sync_point.update_sync_point(
+                        DEALS_SYNC_POINT_KEY,
+                        {"lastSyncTimestamp": get_epoch_timestamp_in_ms()},
+                    )
+                except Exception as opp_ex:
+                    self.logger.error(
+                        "Opportunities sync failed (continuing with other objects): %s",
+                        opp_ex, exc_info=True,
+                    )
+                    newly_synced_opp_ids = set()
 
                 # Step 8.5: Sync soldIn edges (Product -> Deal) from OpportunityLineItems
                 self.logger.info("Syncing soldIn edges (Product -> Deal) from OpportunityLineItems...")
