@@ -58,8 +58,15 @@ from app.connectors.core.registry.connector_builder import (
 from app.connectors.core.constants import CONNECTOR_EMAIL_IDENTITY_INFO
 from app.connectors.sources.salesforce.common.auth_fields import salesforce_login_url_field
 from app.connectors.core.registry.filters import (
+    FilterCategory,
     FilterCollection,
+    FilterField,
+    FilterOption,
+    FilterOptionsResponse,
+    FilterType,
     IndexingFilterKey,
+    MultiselectOperator,
+    OptionSourceType,
     SyncFilterKey,
     load_connector_filters,
 )
@@ -587,6 +594,8 @@ _CUSTOM_OBJECT_FIELD_TYPES: frozenset = frozenset({
 
 _CUSTOM_OBJECTS_SYNC_POINT_PREFIX = "custom_object:"
 _CUSTOM_OBJECT_GROUP_PREFIX = "sf-custom:"
+# Sync filter key for the Salesforce object picker (custom + standard).
+_SOBJECT_NAMES_FILTER = "sobject_names"
 
 
 def _is_syncable_custom_sobject(meta: Dict[str, Any]) -> bool:
@@ -968,6 +977,19 @@ def _ts_in_bounds(
         ))
         .add_filter_field(CommonFields.modified_date_filter("Filter content by modification date."))
         .add_filter_field(CommonFields.created_date_filter("Filter content by creation date."))
+        .add_filter_field(FilterField(
+            name=_SOBJECT_NAMES_FILTER,
+            display_name="Salesforce Objects",
+            description=(
+                "Search and select which Salesforce objects to pull. "
+                "Custom (__c) selections control custom-object indexing; "
+                "save anytime and add more later. Leave empty to sync no custom objects."
+            ),
+            filter_type=FilterType.MULTISELECT,
+            category=FilterCategory.SYNC,
+            option_source_type=OptionSourceType.DYNAMIC,
+            default_operator=MultiselectOperator.IN.value,
+        ))
         .add_filter_field(CommonFields.enable_manual_sync_filter())
         .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
@@ -1060,22 +1082,8 @@ class SalesforceConnector(BaseConnector):
             pass
         return self.api_version
 
-    async def _get_custom_object_allowlist(self) -> List[str]:
-        """Return configured custom-object API names to sync.
-
-        Reads ``customObjectAllowlist`` from connector config. Empty/missing means
-        sync no custom objects (default deny) so junk __c types cannot flood the graph.
-        """
-        try:
-            config = await self.config_service.get_config(
-                f"/services/connectors/{self.connector_id}/config"
-            )
-        except Exception as e:
-            self.logger.warning("Could not read customObjectAllowlist: %s", e)
-            return []
-        if not config:
-            return []
-        raw = config.get("customObjectAllowlist")
+    def _normalize_sobject_name_list(self, raw: Any) -> List[str]:
+        """Deduplicate a list of Salesforce API names from filter/config values."""
         if not isinstance(raw, list):
             return []
         names: List[str] = []
@@ -1089,6 +1097,39 @@ class SalesforceConnector(BaseConnector):
             seen.add(name)
             names.append(name)
         return names
+
+    async def _get_selected_sobject_names(self) -> List[str]:
+        """Return object API names selected in the connector UI / config.
+
+        Preference order:
+        1. Sync filter ``sobject_names`` (searchable multiselect in connector settings)
+        2. Legacy ``customObjectAllowlist`` on connector config
+        """
+        if self.sync_filters:
+            from_filter = self._normalize_sobject_name_list(
+                self.sync_filters.get_value(_SOBJECT_NAMES_FILTER),
+            )
+            if from_filter:
+                return from_filter
+        try:
+            config = await self.config_service.get_config(
+                f"/services/connectors/{self.connector_id}/config"
+            )
+        except Exception as e:
+            self.logger.warning("Could not read sobject selection config: %s", e)
+            return []
+        if not config:
+            return []
+        return self._normalize_sobject_name_list(config.get("customObjectAllowlist"))
+
+    async def _get_custom_object_allowlist(self) -> List[str]:
+        """Return custom-object API names to sync (subset of selected sobjects).
+
+        Empty means sync no custom objects (default deny).
+        """
+        selected = await self._get_selected_sobject_names()
+        # Custom sync path only handles __c / __mdt-style custom names.
+        return [n for n in selected if n.endswith("__c") or n.endswith("__C")]
 
     @staticmethod
     def _soql_failure_message(response: Any) -> str:
@@ -2778,6 +2819,35 @@ class SalesforceConnector(BaseConnector):
         )
         return selected
 
+    async def _list_sobject_filter_options(self) -> List[FilterOption]:
+        """All queryable Salesforce objects (standard + custom) for the picker UI."""
+        if not self.data_source:
+            raise connector_not_ready(self.display_name)
+        api_version = await self._get_api_version()
+        response = await self.data_source.sobject_describe_global(api_version=api_version)
+        if not response.success:
+            raise_for_stream_fetch(
+                success=False,
+                has_payload=False,
+                connector=self.display_name,
+                status=response.status_code,
+                message=self._soql_failure_message(response),
+            )
+        options: List[FilterOption] = []
+        for meta in list((response.data or {}).get("sobjects") or []):
+            name = (meta.get("name") or "").strip()
+            if not name:
+                continue
+            if not meta.get("queryable") or not meta.get("retrieveable"):
+                continue
+            if meta.get("deprecatedAndHidden"):
+                continue
+            label = (meta.get("label") or name).strip()
+            kind = "Custom" if meta.get("custom") else "Standard"
+            options.append(FilterOption(id=name, label=f"{label} ({name}) · {kind}"))
+        options.sort(key=lambda o: o.label.casefold())
+        return options
+
     async def _describe_custom_sobject_fields(
         self, api_version: str, api_name: str,
     ) -> List[Dict[str, Any]]:
@@ -2943,8 +3013,8 @@ class SalesforceConnector(BaseConnector):
         allowlist = await self._get_custom_object_allowlist()
         if not allowlist:
             self.logger.info(
-                "Skipping Salesforce custom objects: customObjectAllowlist is empty "
-                "(set API names on connector config to enable)",
+                "Skipping Salesforce custom objects: no custom objects selected "
+                "(use Salesforce Objects filter in connector settings, or customObjectAllowlist)",
             )
             return
 
@@ -7164,10 +7234,54 @@ class SalesforceConnector(BaseConnector):
         page: int = 1,
         limit: int = 20,
         search: Optional[str] = None,
-        cursor: Optional[str] = None
-    ) -> None:
-        """Salesforce connector does not support dynamic filter options yet."""
-        raise NotImplementedError("Salesforce connector does not support dynamic filter options")
+        cursor: Optional[str] = None,
+    ) -> FilterOptionsResponse:
+        """Searchable Salesforce object picker (standard + custom)."""
+        if filter_key != _SOBJECT_NAMES_FILTER:
+            raise ValueError(f"Unsupported filter key: {filter_key}")
+
+        page_n = max(1, int(page or 1))
+        limit_n = max(1, min(int(limit or 20), 100))
+        try:
+            await self._reinitialize_token_if_needed()
+            if not self.data_source:
+                return FilterOptionsResponse(
+                    success=False,
+                    options=[],
+                    page=page_n,
+                    limit=limit_n,
+                    has_more=False,
+                    message="Salesforce connector not initialized",
+                )
+            options = await self._list_sobject_filter_options()
+            needle = (search or "").strip().casefold()
+            if needle:
+                options = [
+                    o for o in options
+                    if needle in o.label.casefold() or needle in o.id.casefold()
+                ]
+            start = (page_n - 1) * limit_n
+            end = start + limit_n
+            page_options = options[start:end]
+            return FilterOptionsResponse(
+                success=True,
+                options=page_options,
+                page=page_n,
+                limit=limit_n,
+                has_more=end < len(options),
+            )
+        except Exception as e:
+            self.logger.error(
+                "get_filter_options failed for %s: %s", filter_key, e, exc_info=True,
+            )
+            return FilterOptionsResponse(
+                success=False,
+                options=[],
+                page=page_n,
+                limit=limit_n,
+                has_more=False,
+                message=str(e),
+            )
 
     @classmethod
     async def create_connector(
