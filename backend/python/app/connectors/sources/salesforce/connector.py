@@ -981,9 +981,10 @@ def _ts_in_bounds(
             name=_SOBJECT_NAMES_FILTER,
             display_name="Salesforce Objects",
             description=(
-                "Search and select which Salesforce objects to pull. "
-                "Custom (__c) selections control custom-object indexing; "
-                "save anytime and add more later. Leave empty to sync no custom objects."
+                "Browse and select which Salesforce objects to pull from the "
+                "scrollable list. Custom (__c) selections control custom-object "
+                "indexing; save anytime and add more later. Leave empty to sync "
+                "no custom objects."
             ),
             filter_type=FilterType.MULTISELECT,
             category=FilterCategory.SYNC,

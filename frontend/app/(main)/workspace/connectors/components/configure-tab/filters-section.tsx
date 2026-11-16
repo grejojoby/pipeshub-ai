@@ -39,7 +39,10 @@ const MANUAL_INDEXING_FIELD_NAME = 'enable_manual_sync';
 
 const INITIAL_LIMIT = 20;
 const PAGE_LIMIT = 20;
+const INLINE_PAGE_LIMIT = 100;
 const MAX_OPTIONS_IN_MEMORY = 5000;
+/** Fields that use an always-visible scrollable table instead of a compact dropdown. */
+const INLINE_MULTISELECT_FIELDS = new Set(['sobject_names']);
 
 const inputLike: React.CSSProperties = {
   height: 32,
@@ -469,7 +472,8 @@ function useDynamicFilterOptions(
   field: FilterSchemaField,
   connectorId: string | null,
   optionContextGroupPaths?: string[],
-  optionExcludeContextGroupPaths?: string[]
+  optionExcludeContextGroupPaths?: string[],
+  pageSize: number = INITIAL_LIMIT
 ) {
   const { t } = useTranslation();
   const isDynamic = field.optionSourceType === 'dynamic';
@@ -485,6 +489,8 @@ function useDynamicFilterOptions(
   /** Last page fetched for page-based dynamic options (SharePoint, etc.); cursor APIs ignore updates here. */
   const pageRef = useRef(0);
   const searchRef = useRef('');
+  const pageSizeRef = useRef(pageSize);
+  pageSizeRef.current = pageSize;
 
   const loadOptions = useCallback(
     async (append: boolean) => {
@@ -505,6 +511,7 @@ function useDynamicFilterOptions(
       try {
         const search = searchRef.current.trim() || undefined;
         const prevCursorForAppend = append ? cursorRef.current : undefined;
+        const limit = Math.max(1, Math.min(pageSizeRef.current || INITIAL_LIMIT, 100));
 
         const params: {
           limit: number;
@@ -514,7 +521,7 @@ function useDynamicFilterOptions(
           contextGroupPath?: string[];
           excludeContextGroupPath?: string[];
         } = {
-          limit: append ? PAGE_LIMIT : INITIAL_LIMIT,
+          limit,
           ...(search ? { search } : {}),
           ...(!append
             ? { page: 1 }
@@ -606,7 +613,264 @@ function useDynamicFilterOptions(
 // Multi-select (legacy filters parity)
 // ========================================
 
-function ConnectorFilterMultiSelect({
+function ConnectorFilterInlineMultiSelect({
+  field,
+  value,
+  onValueChange,
+  connectorId,
+  optionContextGroupPaths,
+  optionExcludeContextGroupPaths,
+}: {
+  field: FilterSchemaField;
+  value: unknown;
+  onValueChange: (v: unknown) => void;
+  connectorId: string | null;
+  optionContextGroupPaths?: string[];
+  optionExcludeContextGroupPaths?: string[];
+}) {
+  const { t } = useTranslation();
+  const selectedIds = useMemo(() => listFilterIds(value), [value]);
+  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+  const labelsById = useMemo(() => listFilterLabelsById(value), [value]);
+  const dyn = useDynamicFilterOptions(
+    field,
+    connectorId,
+    optionContextGroupPaths,
+    optionExcludeContextGroupPaths,
+    INLINE_PAGE_LIMIT
+  );
+  const listRef = useRef<HTMLDivElement>(null);
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [query, setQuery] = useState('');
+
+  useEffect(() => {
+    if (connectorId) dyn.reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- load once when connector becomes available
+  }, [connectorId, field.name]);
+
+  useEffect(
+    () => () => {
+      if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    },
+    []
+  );
+
+  const options = useMemo(
+    () => dyn.options.map((o) => ({ value: o.id, label: o.label })),
+    [dyn.options]
+  );
+  const mergedOpts = useMemo(
+    () => mergeOptionsWithSelected(options, selectedIds, labelsById),
+    [options, selectedIds, labelsById]
+  );
+
+  const toggle = useCallback(
+    (id: string, checked: boolean) => {
+      const next = checked
+        ? selectedIds.includes(id)
+          ? selectedIds
+          : [...selectedIds, id]
+        : selectedIds.filter((x) => x !== id);
+      onValueChange(buildListPersistedValue(next, value, mergedOpts));
+    },
+    [selectedIds, value, mergedOpts, onValueChange]
+  );
+
+  const clearAll = useCallback(() => {
+    onValueChange(buildListPersistedValue([], value, mergedOpts));
+  }, [value, mergedOpts, onValueChange]);
+
+  const selectVisible = useCallback(() => {
+    const visibleIds = dyn.options.map((o) => o.id);
+    const next = [...selectedIds];
+    for (const id of visibleIds) {
+      if (!next.includes(id)) next.push(id);
+    }
+    onValueChange(buildListPersistedValue(next, value, mergedOpts));
+  }, [dyn.options, selectedIds, value, mergedOpts, onValueChange]);
+
+  const onSearchChange = (nextQuery: string) => {
+    setQuery(nextQuery);
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    searchTimerRef.current = setTimeout(() => dyn.search(nextQuery), 300);
+  };
+
+  if (!connectorId) {
+    return (
+      <Text size="1" color="gray">
+        {t('workspace.connectors.filters.authenticateForOptions')}
+      </Text>
+    );
+  }
+
+  return (
+    <Box
+      style={{
+        width: '100%',
+        border: '1px solid var(--gray-a5)',
+        borderRadius: 'var(--radius-3)',
+        backgroundColor: 'var(--color-surface)',
+        overflow: 'hidden',
+      }}
+    >
+      <Flex
+        align="center"
+        justify="between"
+        gap="3"
+        wrap="wrap"
+        style={{ padding: '10px 12px', borderBottom: '1px solid var(--gray-a4)' }}
+      >
+        <Text size="2" weight="medium" style={{ color: 'var(--gray-12)' }}>
+          {selectedIds.length === 0
+            ? t('workspace.connectors.filters.selectField', { field: field.displayName })
+            : `${selectedIds.length} selected`}
+        </Text>
+        <Flex gap="2" align="center" wrap="wrap">
+          <Button type="button" size="1" variant="soft" color="gray" onClick={selectVisible} disabled={dyn.options.length === 0}>
+            Select visible
+          </Button>
+          <Button type="button" size="1" variant="soft" color="gray" onClick={clearAll} disabled={selectedIds.length === 0}>
+            Clear
+          </Button>
+        </Flex>
+      </Flex>
+
+      <Box style={{ padding: '8px 12px', borderBottom: '1px solid var(--gray-a4)' }}>
+        <TextField.Root
+          size="2"
+          placeholder={t('workspace.connectors.filters.searchOptions')}
+          value={query}
+          onChange={(e) => onSearchChange(e.target.value)}
+        />
+      </Box>
+
+      {selectedIds.length > 0 ? (
+        <Flex
+          wrap="wrap"
+          gap="2"
+          style={{ padding: '8px 12px', borderBottom: '1px solid var(--gray-a4)', maxHeight: 88, overflowY: 'auto' }}
+        >
+          {selectedIds.map((id) => (
+            <Badge
+              key={id}
+              size="1"
+              color="green"
+              variant="soft"
+              title={labelsById[id] || id}
+              style={{ cursor: 'pointer', maxWidth: '100%' }}
+              onClick={() => toggle(id, false)}
+            >
+              {labelsById[id] || id} ×
+            </Badge>
+          ))}
+        </Flex>
+      ) : null}
+
+      <Box
+        ref={listRef}
+        role="listbox"
+        aria-multiselectable="true"
+        onScroll={() => {
+          const el = listRef.current;
+          if (!el) return;
+          if (el.scrollTop + el.clientHeight >= el.scrollHeight - 48) dyn.loadMore();
+        }}
+        style={{ maxHeight: 420, minHeight: 280, overflowY: 'auto', padding: '4px 0' }}
+      >
+        {dyn.initialLoading ? (
+          <Flex align="center" justify="center" gap="2" style={{ padding: '28px 12px' }}>
+            <Spinner size={14} />
+            <Text size="2" style={{ color: 'var(--slate-11)' }}>
+              {t('workspace.connectors.filters.loadingOptions')}
+            </Text>
+          </Flex>
+        ) : dyn.options.length === 0 ? (
+          <Text size="2" style={{ color: 'var(--slate-9)', display: 'block', padding: '16px 12px' }}>
+            {dyn.emptyMessage || t('workspace.connectors.filters.noResults')}
+          </Text>
+        ) : (
+          dyn.options.map((opt) => {
+            const checked = selectedSet.has(opt.id);
+            const isCustom = opt.id.endsWith('__c') || opt.id.endsWith('__C');
+            return (
+              <Flex
+                key={opt.id}
+                role="option"
+                aria-selected={checked}
+                align="center"
+                gap="3"
+                onClick={() => toggle(opt.id, !checked)}
+                style={{
+                  padding: '10px 12px',
+                  cursor: 'pointer',
+                  borderBottom: '1px solid var(--gray-a3)',
+                  backgroundColor: checked ? 'var(--green-a2)' : 'transparent',
+                }}
+              >
+                <Checkbox
+                  checked={checked}
+                  onCheckedChange={(v) => toggle(opt.id, v === true)}
+                  onClick={(e) => e.stopPropagation()}
+                />
+                <Box style={{ flex: 1, minWidth: 0 }}>
+                  <Text size="2" style={{ color: 'var(--gray-12)', display: 'block', lineHeight: 1.35 }}>
+                    {opt.label}
+                  </Text>
+                  <Text size="1" style={{ color: 'var(--gray-10)', display: 'block', marginTop: 2 }}>
+                    {opt.id}
+                  </Text>
+                </Box>
+                {isCustom ? (
+                  <Badge size="1" color="blue" variant="soft">
+                    custom
+                  </Badge>
+                ) : (
+                  <Badge size="1" color="gray" variant="soft">
+                    standard
+                  </Badge>
+                )}
+              </Flex>
+            );
+          })
+        )}
+        {dyn.loadingMore ? (
+          <Flex align="center" justify="center" gap="2" style={{ padding: '12px' }}>
+            <Spinner size={12} />
+            <Text size="1" color="gray">
+              Loading more…
+            </Text>
+          </Flex>
+        ) : null}
+      </Box>
+    </Box>
+  );
+}
+
+function ConnectorFilterMultiSelect(props: {
+  field: FilterSchemaField;
+  value: unknown;
+  onValueChange: (v: unknown) => void;
+  connectorId: string | null;
+  portalContainer: HTMLElement | null;
+  optionContextGroupPaths?: string[];
+  optionExcludeContextGroupPaths?: string[];
+}) {
+  if (INLINE_MULTISELECT_FIELDS.has(props.field.name)) {
+    return (
+      <ConnectorFilterInlineMultiSelect
+        field={props.field}
+        value={props.value}
+        onValueChange={props.onValueChange}
+        connectorId={props.connectorId}
+        optionContextGroupPaths={props.optionContextGroupPaths}
+        optionExcludeContextGroupPaths={props.optionExcludeContextGroupPaths}
+      />
+    );
+  }
+  return <ConnectorFilterDropdownMultiSelect {...props} />;
+}
+
+function ConnectorFilterDropdownMultiSelect({
   field,
   value,
   onValueChange,
@@ -626,6 +890,7 @@ function ConnectorFilterMultiSelect({
   optionExcludeContextGroupPaths?: string[];
 }) {
   const { t } = useTranslation();
+
   const selectedIds = useMemo(() => listFilterIds(value), [value]);
   const labelsById = useMemo(() => listFilterLabelsById(value), [value]);
   const dyn = useDynamicFilterOptions(
@@ -660,7 +925,6 @@ function ConnectorFilterMultiSelect({
     [dynamicOpts, selectedIds, labelsById]
   );
 
-  const plural = t('workspace.connectors.filters.fieldValues', { field: field.displayName });
   const selectLabel = t('workspace.connectors.filters.selectField', { field: field.displayName });
 
   if (dyn.isDynamic && !connectorId) {
