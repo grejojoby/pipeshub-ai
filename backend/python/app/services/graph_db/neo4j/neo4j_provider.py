@@ -13409,15 +13409,15 @@ class Neo4jProvider(NamedEntityGraphMixin, IGraphDBProvider):
             is_kb = bool(app_result) and app_result[0].get("type") == Connectors.KNOWLEDGE_BASE.value
             self.logger.debug(f"📊 Computing {'KB collection' if is_kb else 'external connector'} stats for {connector_id}")
 
-            # Only records reached from the App count: a group cut off from it and
-            # its records stay out. A record in several groups (a Drive file and a
-            # sharee's Shared-with-Me group) counts once. A folder is told by the
-            # record's own mimeType, not a hop to its File node.
+            # Prefer the indexed connectorId property for external connectors —
+            # the BELONGS_TO*1..10 walk is too expensive at multi-million-record scale
+            # and OOMs the Neo4j transaction pool. KB collections still link records
+            # directly to the App. Skip the StageState OPTIONAL MATCH here: overview
+            # counts only need recordType/indexing/extraction; entitiesStatus stays 0.
             linkage = (
                 "MATCH (:App {id: $connector_id})<-[:BELONGS_TO]-(r:Record)"
                 if is_kb
-                else "MATCH (:App {id: $connector_id})<-[:BELONGS_TO*1..10]-(:RecordGroup)"
-                     "<-[:BELONGS_TO]-(r:Record)"
+                else "MATCH (r:Record {connectorId: $connector_id})"
             )
 
             query = f"""
@@ -13426,12 +13426,8 @@ class Neo4jProvider(NamedEntityGraphMixin, IGraphDBProvider):
               AND coalesce(r.isPlaceholder, false) = false
               AND coalesce(r.isDeleted, false) = false
               AND NOT coalesce(r.mimeType, '') IN $folder_mime_types
-            WITH DISTINCT r
-            // Named entities have no record field: their stage state on the record's revision, by id.
-            OPTIONAL MATCH (s:{collection_to_label(CollectionNames.STAGE_STATES.value)}
-                {{id: r.virtualRecordId + ':' + r.contentRev + ':entities'}})
             RETURN r.recordType AS recordType, r.indexingStatus AS indexingStatus,
-                   r.extractionStatus AS extractionStatus, s.status AS entitiesStatus, count(r) AS cnt
+                   r.extractionStatus AS extractionStatus, null AS entitiesStatus, count(r) AS cnt
             """
 
             results = await self.client.execute_query(

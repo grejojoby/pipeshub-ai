@@ -2748,10 +2748,24 @@ async def get_connector_stats_endpoint(
             request, graph_provider, connector_registry, connector_id, org_id
         )
 
+        # Short-TTL cache: overview polls this while Neo4j is already under indexing load.
+        cache_key = f"connector_stats_cache/{org_id}/{connector_id}"
+        kv = request.app.container.key_value_store()
+        try:
+            cached = await kv.get_key(cache_key)
+            if isinstance(cached, dict) and cached:
+                return {"success": True, "data": cached, "cached": True}
+        except Exception as cache_err:  # noqa: BLE001 - stats must still work if cache is down
+            logger.warning("connector stats cache read failed: %s", cache_err)
+
         # Fetch stats from graph provider
         result = await graph_provider.get_connector_stats(org_id, connector_id)
         if result["success"]:
-             return {"success": True, "data": result["data"]}
+            try:
+                await kv.create_key(cache_key, result["data"], overwrite=True, ttl=60)
+            except Exception as cache_err:  # noqa: BLE001
+                logger.warning("connector stats cache write failed: %s", cache_err)
+            return {"success": True, "data": result["data"]}
         else:
             raise HTTPException(status_code=HttpStatusCode.NOT_FOUND.value, detail=f"No data found for connector {connector_id}")
     except HTTPException:
