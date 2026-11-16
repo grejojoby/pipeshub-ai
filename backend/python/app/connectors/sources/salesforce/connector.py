@@ -1060,6 +1060,36 @@ class SalesforceConnector(BaseConnector):
             pass
         return self.api_version
 
+    async def _get_custom_object_allowlist(self) -> List[str]:
+        """Return configured custom-object API names to sync.
+
+        Reads ``customObjectAllowlist`` from connector config. Empty/missing means
+        sync no custom objects (default deny) so junk __c types cannot flood the graph.
+        """
+        try:
+            config = await self.config_service.get_config(
+                f"/services/connectors/{self.connector_id}/config"
+            )
+        except Exception as e:
+            self.logger.warning("Could not read customObjectAllowlist: %s", e)
+            return []
+        if not config:
+            return []
+        raw = config.get("customObjectAllowlist")
+        if not isinstance(raw, list):
+            return []
+        names: List[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            name = item.strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+        return names
+
     @staticmethod
     def _soql_failure_message(response: Any) -> str:
         """Build a user-facing message from a failed Salesforce response.
@@ -2908,24 +2938,46 @@ class SalesforceConnector(BaseConnector):
             return total, total_new, total_updated
 
     async def _sync_all_custom_objects(self, api_version: str) -> None:
-        """Discover and sync every queryable custom Salesforce object into searchable Records."""
+        """Discover syncable custom objects, then sync only the configured allowlist."""
         self.logger.info("Syncing Salesforce custom objects (discover + index)...")
+        allowlist = await self._get_custom_object_allowlist()
+        if not allowlist:
+            self.logger.info(
+                "Skipping Salesforce custom objects: customObjectAllowlist is empty "
+                "(set API names on connector config to enable)",
+            )
+            return
+
         try:
             custom_objects = await self._list_custom_sobjects(api_version)
         except Exception as e:
             self.logger.error("Custom object discovery failed: %s", e, exc_info=True)
             return
 
+        allow = set(allowlist)
+        selected = [m for m in custom_objects if (m.get("name") or "") in allow]
+        skipped = sorted(allow - {(m.get("name") or "") for m in custom_objects})
+        self.logger.info(
+            "Custom object allowlist: %d configured, %d matched discovery, %d not found in org: %s",
+            len(allowlist), len(selected), len(skipped), skipped or "[]",
+        )
+        if not selected:
+            self.logger.warning(
+                "No discovered custom objects match customObjectAllowlist=%s", allowlist,
+            )
+            return
+
         grand_total = grand_new = grand_updated = 0
-        for meta in custom_objects:
+        for meta in selected:
             t, n, u = await self._sync_one_custom_object(api_version, meta)
             grand_total += t
             grand_new += n
             grand_updated += u
 
         self.logger.info(
-            "Finished Salesforce custom objects: %d objects considered, %d rows synced (%d new, %d updated)",
-            len(custom_objects), grand_total, grand_new, grand_updated,
+            "Finished Salesforce custom objects: %d objects synced of %d discovered "
+            "(%d rows; %d new, %d updated)",
+            len(selected), len(custom_objects), grand_total, grand_new, grand_updated,
         )
 
     async def _process_custom_object_record(self, record: Record) -> bytes:
