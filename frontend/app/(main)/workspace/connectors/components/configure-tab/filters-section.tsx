@@ -744,28 +744,6 @@ function ConnectorFilterInlineMultiSelect({
         />
       </Box>
 
-      {selectedIds.length > 0 ? (
-        <Flex
-          wrap="wrap"
-          gap="2"
-          style={{ padding: '8px 12px', borderBottom: '1px solid var(--gray-a4)', maxHeight: 88, overflowY: 'auto' }}
-        >
-          {selectedIds.map((id) => (
-            <Badge
-              key={id}
-              size="1"
-              color="green"
-              variant="soft"
-              title={labelsById[id] || id}
-              style={{ cursor: 'pointer', maxWidth: '100%' }}
-              onClick={() => toggle(id, false)}
-            >
-              {labelsById[id] || id} ×
-            </Badge>
-          ))}
-        </Flex>
-      ) : null}
-
       <Box
         ref={listRef}
         role="listbox"
@@ -1682,6 +1660,28 @@ function FilterCategoryBlock({
           <Flex direction="column" gap="3" style={{ marginBottom: 14 }}>
             {configuredPreviewItems.map((item) =>
               item.kind === 'list' ? (
+                INLINE_MULTISELECT_FIELDS.has(item.name) ? (
+                  <Badge
+                    key={item.name}
+                    size="1"
+                    color="green"
+                    variant="soft"
+                    radius="full"
+                    title={item.valueLabels.join(', ')}
+                    style={{
+                      width: 'fit-content',
+                      maxWidth: '100%',
+                      whiteSpace: 'normal',
+                      wordBreak: 'break-word',
+                      height: 'auto',
+                      textAlign: 'left',
+                      lineHeight: 1.35,
+                      padding: '6px 10px',
+                    }}
+                  >
+                    {item.fieldLabel} · {item.operatorLabel} · {item.valueLabels.length} selected
+                  </Badge>
+                ) : (
                 <Box key={item.name} style={{ width: '100%', minWidth: 0 }}>
                   <Text
                     size="1"
@@ -1714,6 +1714,7 @@ function FilterCategoryBlock({
                     ))}
                   </Flex>
                 </Box>
+                )
               ) : (
                 <Badge
                   key={item.name}
