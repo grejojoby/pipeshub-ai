@@ -1,14 +1,8 @@
 name: Deploy main image
 
-# Push to main builds this repo's Dockerfile on the server and recreates
-# pipeshub-ai from that image. The server must not keep running
-# pipeshubai/pipeshub-ai:latest with files copied in after the fact: a
-# recreate throws those copies away.
-#
-# Required repository secrets:
-#   DEPLOY_SSH_KEY   private key authorized on the server
-#   DEPLOY_HOST      server address
-#   DEPLOY_USER      ssh user (root)
+# Keep the published pipeshubai/pipeshub-ai image (the ~11GB runtime with
+# models and dependencies) and copy this repo's app diffs onto it. Do not
+# rebuild that image on each push.
 
 on:
   push:
@@ -27,7 +21,7 @@ jobs:
   deploy:
     if: github.repository == 'grejojoby/pipeshub-ai'
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 30
     steps:
       - name: Checkout deploy script
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,7 +30,7 @@ jobs:
           sparse-checkout: deployment/deploy-main-image.sh
           sparse-checkout-cone-mode: false
 
-      - name: Build this commit on the server and switch to it
+      - name: Mount this commit's app diffs on the published image
         env:
           SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           SSH_HOST: ${{ secrets.DEPLOY_HOST }}
@@ -54,6 +48,6 @@ jobs:
           ssh-keyscan -T 10 -t ed25519 "$SSH_HOST" > ~/.ssh/known_hosts
           grep -q 'AAAAC3NzaC1lZDI1NTE5AAAAIJoZVl++Y44bif85TEHVUeS6tM1tJltVurddrfujBf/6' ~/.ssh/known_hosts
           ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes \
-            -o ServerAliveInterval=30 -o ServerAliveCountMax=240 \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=40 \
             "${SSH_USER}@${SSH_HOST}" "bash -s -- ${SHA}" \
             < deployment/deploy-main-image.sh
