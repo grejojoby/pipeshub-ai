@@ -1,8 +1,8 @@
 name: Deploy main image
 
-# Keep the published pipeshubai/pipeshub-ai image (the ~11GB runtime with
-# models and dependencies) and copy this repo's app diffs onto it. Do not
-# rebuild that image on each push.
+# Stable module: pipeshubai/pipeshub-ai (models, browsers, Python packages).
+# App module: deployment/modules/Dockerfile.app, rebuilt on each push.
+# The app build only copies application files onto the stable image.
 
 on:
   push:
@@ -21,7 +21,7 @@ jobs:
   deploy:
     if: github.repository == 'grejojoby/pipeshub-ai'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout deploy script
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -30,7 +30,7 @@ jobs:
           sparse-checkout: deployment/deploy-main-image.sh
           sparse-checkout-cone-mode: false
 
-      - name: Mount this commit's app diffs on the published image
+      - name: Build the app module and recreate pipeshub-ai
         env:
           SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           SSH_HOST: ${{ secrets.DEPLOY_HOST }}
