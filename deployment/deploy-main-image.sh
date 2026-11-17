@@ -79,6 +79,8 @@ prepare_context() {
   mkdir -p "$STAGE/public"
   cp "$SRC/deployment/modules/Dockerfile.app" "$STAGE/Dockerfile"
   cp "$SRC/backend/python/app/connectors/sources/salesforce/connector.py" "$STAGE/connector.py"
+  cp "$SRC/backend/python/app/connectors/core/base/data_processor/data_source_entities_processor.py" \
+    "$STAGE/data_source_entities_processor.py"
   cp "$router_src" "$STAGE/router.py"
   cp "$neo_src" "$STAGE/neo4j_provider.py"
   cp -a "$ROOT/frontend-out-new/." "$STAGE/public/"
@@ -96,7 +98,7 @@ build_app() {
 smoke() {
   docker run --rm --network none --entrypoint python3 \
     -e PYTHONPATH=/app/python "${APP_IMAGE}:${SHA}" \
-    -c "import app.connectors.sources.salesforce.connector; import app.connectors.api.router; print('smoke-ok')"
+    -c "import app.connectors.sources.salesforce.connector; import app.connectors.api.router; import app.connectors.core.base.data_processor.data_source_entities_processor; print('smoke-ok')"
 }
 
 echo "building app module from repo files"

@@ -16,6 +16,7 @@ FROM ${BASE_IMAGE}
 COPY connector.py /app/python/app/connectors/sources/salesforce/connector.py
 COPY router.py /app/python/app/connectors/api/router.py
 COPY neo4j_provider.py /app/python/app/services/graph_db/neo4j/neo4j_provider.py
+COPY data_source_entities_processor.py /app/python/app/connectors/core/base/data_processor/data_source_entities_processor.py
 COPY public/ /app/backend/dist/public/
 
 ARG GIT_COMMIT=""
