@@ -539,6 +539,8 @@ class EventService:
                 return await self._handle_reindex(connector_name, payload)
             elif action == "delete":
                 return await self._handle_delete(connector_name, payload)
+            elif action == "purgedata":
+                return await self._handle_purge_data(connector_name, payload)
             else:
                 self.logger.error(f"Unknown {connector_name.capitalize()} connector event type: {action}")
                 return False
@@ -1637,6 +1639,165 @@ class EventService:
             )
         finally:
             await cleanup_helper.close()
+
+    async def _handle_purge_data(self, connector_name: str, payload: dict[str, Any]) -> bool:
+        """Purge synced data/indexes for a connector while keeping App + config/auth."""
+        org_id = payload.get("orgId")
+        connector_id = payload.get("connectorId")
+        previous_is_active = payload.get("previousIsActive", False)
+
+        if not org_id or not connector_id:
+            self.logger.error("'orgId' and 'connectorId' are required in the purgeData payload")
+            return False
+
+        self.logger.info(
+            "Processing data purge for %s connector %s", connector_name, connector_id
+        )
+        cleanup_helper = None
+        try:
+            try:
+                current = await self.graph_provider.get_document(
+                    connector_id, CollectionNames.APPS.value
+                )
+                if (current or {}).get(ConnectorStateKeys.PENDING_RESYNC):
+                    await self.graph_provider.update_node(
+                        connector_id,
+                        CollectionNames.APPS.value,
+                        {ConnectorStateKeys.PENDING_RESYNC: False},
+                    )
+            except Exception as clear_err:
+                self.logger.warning(
+                    "Could not clear pendingResync for %s before purge: %s",
+                    connector_id, clear_err,
+                )
+
+            coordinator = get_coordinator()
+            if coordinator is not None:
+                await coordinator.cancel_and_wait(connector_id)
+            await reindex_task_manager.cancel_by_prefix(f"reindex:{connector_id}:")
+            await self._await_remote_sync_stop(connector_id)
+
+            config_service = self.app_container.config_service()
+            await record_pending_entity_cleanup(
+                config_service,
+                org_id=org_id, connector_id=connector_id, connector_name=connector_name,
+            )
+
+            try:
+                result = await self.graph_provider.purge_connector_data(
+                    connector_id=connector_id,
+                    org_id=org_id,
+                )
+            finally:
+                await notify_principals_changed(org_id)
+
+            if not result.get("success"):
+                raise Exception(result.get("error", "Unknown purge failure from graph DB"))
+
+            self.logger.info(
+                "Graph data purge complete for connector %s. Records: %s",
+                connector_id, result.get("deleted_records_count", 0),
+            )
+
+            events = build_connector_cleanup_events(
+                org_id=org_id,
+                connector_id=connector_id,
+                vector_membership_backfilled=result.get(
+                    "vector_membership_backfilled", False
+                ),
+                vector_membership_backfill_exhausted=result.get(
+                    "vector_membership_backfill_exhausted", False
+                ),
+                connector_name=result.get("connector_name"),
+                record_group_ids=result.get("record_group_ids"),
+                virtual_record_ids=result.get("virtual_record_ids", []),
+            )
+            published = 0
+            for event in events:
+                try:
+                    await self.app_container.messaging_producer.send_message(
+                        topic="record-events",
+                        message=event,
+                    )
+                    published += 1
+                except Exception as kafka_err:
+                    log_cleanup_publish_failure(
+                        self.logger, event, f"connector {connector_id}", kafka_err
+                    )
+            if events:
+                level = self.logger.info if published == len(events) else self.logger.error
+                level(
+                    "Published %s/%s vector-cleanup event(s) for purged connector %s",
+                    published, len(events), connector_id,
+                )
+
+            try:
+                cleanup_helper = StorageCleanupHelper(
+                    self.logger, self.graph_provider, config_service
+                )
+                await cleanup_helper.release_connector_storage(org_id, connector_id)
+            except Exception as storage_err:
+                self.logger.warning(
+                    "Blob storage release after purge failed for %s: %s",
+                    connector_id, storage_err, exc_info=True,
+                )
+            finally:
+                if cleanup_helper is not None:
+                    try:
+                        await cleanup_helper.close()
+                    except Exception:
+                        pass
+
+            try:
+                redis_provider = await self.app_container.redis_provider()
+                client = redis_provider.get_client()
+                await client.delete(f"connector_stats:v1:{org_id}:{connector_id}")
+                await client.delete(f"connector_stats_cache/{org_id}/{connector_id}")
+            except Exception as cache_err:
+                self.logger.warning(
+                    "Could not clear stats cache after purge of %s: %s",
+                    connector_id, cache_err,
+                )
+
+            await self.graph_provider.update_node(
+                connector_id,
+                CollectionNames.APPS.value,
+                {
+                    "status": None,
+                    "isActive": bool(previous_is_active),
+                    "isLocked": False,
+                    "updatedAtTimestamp": get_epoch_timestamp_in_ms(),
+                },
+            )
+            self.logger.info("Data purge complete for connector %s", connector_id)
+            return True
+
+        except Exception as e:
+            self.logger.error(
+                "Data purge failed for connector %s: %s", connector_id, e, exc_info=True,
+            )
+            try:
+                if await self.graph_provider.get_document(
+                    connector_id, CollectionNames.APPS.value, raise_on_error=True
+                ) is None:
+                    return False
+                await self.graph_provider.batch_upsert_nodes(
+                    [{
+                        "id": connector_id,
+                        "status": None,
+                        "isActive": previous_is_active,
+                        "isLocked": False,
+                        "updatedAtTimestamp": get_epoch_timestamp_in_ms(),
+                    }],
+                    CollectionNames.APPS.value,
+                )
+                self.logger.info("Reverted PURGING status for connector %s", connector_id)
+            except Exception as revert_err:
+                self.logger.error(
+                    "Failed to revert PURGING for connector %s: %s",
+                    connector_id, revert_err,
+                )
+            return False
 
     async def _handle_delete(self, connector_name: str, payload: dict[str, Any]) -> bool:
         """

@@ -20,6 +20,8 @@ export const CONNECTOR_SECRET_MASK = '••••••••' as const;
 
 export const CONNECTOR_INSTANCE_STATUS = {
   DELETING: 'DELETING',
+  /** Clearing synced records/indexes while keeping connector config. */
+  PURGING: 'PURGING',
   SYNCING: 'SYNCING',
   FULL_SYNCING: 'FULL_SYNCING',
   /** Accepted but not started: the sync concurrency limit was reached. */

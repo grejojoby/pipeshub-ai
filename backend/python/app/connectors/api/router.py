@@ -8536,6 +8536,151 @@ async def toggle_connector_instance(
         ) from e
 
 
+
+@router.post(
+    "/api/v1/connectors/{connector_id}/purge-data",
+    dependencies=[
+        Depends(require_scopes(OAuthScopes.CONNECTOR_DELETE)),
+        Depends(require_connector_not_locked),
+    ],
+)
+async def purge_connector_data(
+    connector_id: str,
+    request: Request,
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider),
+) -> JSONResponse:
+    """Clear all synced records/indexes for a connector without removing its config.
+
+    Stops sync, marks the connector PURGING, and publishes a
+    ``{connectorType}.purgeData`` event. The App node, OAuth/config, and
+    authentication stay so the connector can sync again afterward.
+    """
+    container = request.app.container
+    logger = container.logger()
+    connector_registry = request.app.state.connector_registry
+
+    try:
+        user_id = request.state.user.get("userId")
+        org_id = request.state.user.get("orgId")
+        is_admin = is_request_admin(request)
+
+        if not user_id or not org_id:
+            raise HTTPException(
+                status_code=HttpStatusCode.UNAUTHORIZED.value,
+                detail="User not authenticated",
+            )
+
+        instance = await connector_registry.get_connector_instance(
+            connector_id=connector_id,
+            user_id=user_id,
+            org_id=org_id,
+            is_admin=is_admin,
+        )
+        if not instance:
+            raise HTTPException(
+                status_code=HttpStatusCode.NOT_FOUND.value,
+                detail=not_found("This connector"),
+            )
+
+        connector_type = instance.get("type", "")
+        await check_beta_connector_access(connector_type, request)
+        _validate_connector_deletion_permissions(
+            instance, user_id, is_admin=is_admin, logger=logger
+        )
+
+        status = instance.get("status")
+        if status in ("DELETING", "PURGING"):
+            raise HTTPException(
+                status_code=HttpStatusCode.CONFLICT.value,
+                detail=f"Connector is already {status}",
+            )
+
+        logger.info(
+            "Initiating data purge for connector %s by user %s", connector_id, user_id
+        )
+        producer = container.messaging_producer
+        purging_at = get_epoch_timestamp_in_ms()
+        previous_is_active = instance.get("isActive", False)
+
+        await graph_provider.update_node(
+            connector_id,
+            CollectionNames.APPS.value,
+            {"status": "PURGING", "updatedAtTimestamp": purging_at},
+        )
+
+        try:
+            disable_message = {
+                "eventType": "appDisabled",
+                "payload": {
+                    "orgId": org_id,
+                    "appGroup": instance.get("appGroup"),
+                    "appGroupId": instance.get("appGroupId"),
+                    "connectorId": connector_id,
+                    "apps": [connector_type.replace(" ", "").lower()],
+                    "scope": instance.get("scope"),
+                },
+                "timestamp": get_epoch_timestamp_in_ms(),
+            }
+            await producer.send_message(topic="entity-events", message=disable_message)
+        except Exception as e:
+            logger.error(
+                "Failed to send appDisabled for purge of %s: %s. Proceeding.",
+                connector_id, e,
+            )
+
+        event_type = f"{connector_type.replace(' ', '').lower()}.purgeData"
+        purge_message = {
+            "eventType": event_type,
+            "payload": {
+                "orgId": org_id,
+                "connectorId": connector_id,
+                "connectorType": connector_type,
+                "appGroup": instance.get("appGroup"),
+                "appGroupId": instance.get("appGroupId"),
+                "scope": instance.get("scope"),
+                "previousIsActive": previous_is_active,
+                "initiatedBy": user_id,
+            },
+            "timestamp": get_epoch_timestamp_in_ms(),
+        }
+        try:
+            await producer.send_message(
+                topic="sync-events", message=purge_message, key=connector_id
+            )
+        except Exception:
+            try:
+                await graph_provider.update_node_fields_if_match(
+                    connector_id,
+                    CollectionNames.APPS.value,
+                    {"status": None, "updatedAtTimestamp": get_epoch_timestamp_in_ms()},
+                    {"status": "PURGING", "updatedAtTimestamp": purging_at},
+                )
+            except Exception:
+                logger.exception("Could not clear PURGING for connector %s", connector_id)
+            raise
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "success": True,
+                "message": "Connector data purge initiated",
+                "connectorId": connector_id,
+                "status": "PURGING",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Failed to initiate data purge for connector %s: %s",
+            connector_id, e, exc_info=True,
+        )
+        raise HTTPException(
+            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+            detail="Failed to initiate connector data purge. Please try again.",
+        ) from e
+
+
 @router.delete("/api/v1/connectors/{connector_id}", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_DELETE)), Depends(require_connector_not_locked)])
 async def delete_connector_instance(
     connector_id: str,

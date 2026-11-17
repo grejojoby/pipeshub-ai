@@ -428,7 +428,12 @@ function TeamConnectorsPageContent() {
 
   const handleToggleSyncActive = useCallback(
     async (instance: ConnectorInstance) => {
-      if (!instance._key || instance.status === CONNECTOR_INSTANCE_STATUS.DELETING) return;
+      if (
+        !instance._key ||
+        instance.status === CONNECTOR_INSTANCE_STATUS.DELETING ||
+        instance.status === CONNECTOR_INSTANCE_STATUS.PURGING
+      )
+        return;
       try {
         if (!instance.isActive) {
           const outcome = await toggleConnectorSyncOn(instance._key, instance.type);

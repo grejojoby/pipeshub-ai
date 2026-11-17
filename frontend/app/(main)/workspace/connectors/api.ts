@@ -182,6 +182,26 @@ export const ConnectorsApi = {
     return parseDeleteConnectorInstanceBody(data ?? null, connectorId);
   },
 
+  /**
+   * Clear synced records/indexes for a connector without removing its App/config/auth.
+   * Returns 202 while the backend runs the purge asynchronously (status → PURGING).
+   */
+  async purgeConnectorData(connectorId: string): Promise<{
+    success: boolean;
+    message: string;
+    connectorId: string;
+    status: string;
+  }> {
+    const { data } = await apiClient.post<{
+      success: boolean;
+      message: string;
+      connectorId: string;
+      status: string;
+    }>(`${BASE_URL}/${connectorId}/purge-data`, undefined, { suppressErrorToast: true });
+    revalidateSwrNamespace(SWR_NS.teamConnectorLists);
+    return data;
+  },
+
   /** Update connector instance name */
   async updateConnectorInstanceName(connectorId: string, instanceName: string) {
     const { data } = await apiClient.put(`${BASE_URL}/${connectorId}/name`, {

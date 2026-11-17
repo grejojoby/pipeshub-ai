@@ -90,16 +90,21 @@ export function InstanceCard({
     instance.supportsSync &&
     instance.isConfigured &&
     !oauthAuthIncomplete &&
-    instance.status !== CONNECTOR_INSTANCE_STATUS.DELETING;
+    instance.status !== CONNECTOR_INSTANCE_STATUS.DELETING &&
+    instance.status !== CONNECTOR_INSTANCE_STATUS.PURGING;
 
   const syncToggleHelp: string | null =
     instance.status === CONNECTOR_INSTANCE_STATUS.DELETING
       ? t('workspace.connectors.instanceCard.removing')
-      : !instance.isConfigured
-        ? t('workspace.connectors.instanceCard.configureFirst')
-        : oauthAuthIncomplete
-          ? t('workspace.connectors.instanceCard.authenticateFirst')
-          : null;
+      : instance.status === CONNECTOR_INSTANCE_STATUS.PURGING
+        ? t('workspace.connectors.instanceCard.purging', {
+            defaultValue: 'Data purge in progress',
+          })
+        : !instance.isConfigured
+          ? t('workspace.connectors.instanceCard.configureFirst')
+          : oauthAuthIncomplete
+            ? t('workspace.connectors.instanceCard.authenticateFirst')
+            : null;
 
   const syncSwitchDisabled =
     !canToggleSync || syncToggleBusy || !onToggleSyncActive;
@@ -109,7 +114,8 @@ export function InstanceCard({
     instance.isActive &&
     instance.isConfigured &&
     !oauthAuthIncomplete &&
-    instance.status !== CONNECTOR_INSTANCE_STATUS.DELETING;
+    instance.status !== CONNECTOR_INSTANCE_STATUS.DELETING &&
+    instance.status !== CONNECTOR_INSTANCE_STATUS.PURGING;
 
   const runSyncToggle = async () => {
     if (!onToggleSyncActive || !instance._key || syncToggleBusy) return;

@@ -6156,6 +6156,18 @@ class IGraphDBProvider(ABC):
         """
         raise NotImplementedError
 
+    async def purge_connector_data(
+        self,
+        connector_id: str,
+        org_id: str,
+        transaction: str | None = None,
+    ) -> dict[str, Any]:
+        """Delete synced connector data but keep the connector App/config.
+
+        Default: not supported. Neo4j implements this for production purge-data.
+        """
+        raise NotImplementedError("purge_connector_data is not supported on this graph backend")
+
     @abstractmethod
     async def delete_connector_instance(
         self,

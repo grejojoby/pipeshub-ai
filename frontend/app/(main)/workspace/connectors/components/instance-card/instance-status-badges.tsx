@@ -62,6 +62,7 @@ const SYNC_I18N: Record<InstanceSyncOperationKey, string> = {
   full_syncing: 'workspace.connectors.instanceStatus.sync.fullSyncing',
   queued: 'workspace.connectors.instanceStatus.sync.queued',
   deleting: 'workspace.connectors.instanceStatus.sync.removing',
+  purging: 'workspace.connectors.instanceStatus.sync.purging',
 };
 
 const SYNC_TOOLTIP_I18N: Record<InstanceSyncOperationKey, string> = {
@@ -69,6 +70,7 @@ const SYNC_TOOLTIP_I18N: Record<InstanceSyncOperationKey, string> = {
   full_syncing: 'workspace.connectors.instanceStatus.sync.fullSyncingTooltip',
   queued: 'workspace.connectors.instanceStatus.sync.queuedTooltip',
   deleting: 'workspace.connectors.instanceStatus.sync.removingTooltip',
+  purging: 'workspace.connectors.instanceStatus.sync.purgingTooltip',
 };
 
 const SYNC_LABEL_DEFAULTS: Record<InstanceSyncOperationKey, string> = {
@@ -76,6 +78,7 @@ const SYNC_LABEL_DEFAULTS: Record<InstanceSyncOperationKey, string> = {
   full_syncing: 'Full sync in progress',
   queued: 'Queued',
   deleting: 'Removing',
+  purging: 'Purging data',
 };
 
 const SYNC_TOOLTIP_DEFAULTS: Record<InstanceSyncOperationKey, string> = {
@@ -84,6 +87,7 @@ const SYNC_TOOLTIP_DEFAULTS: Record<InstanceSyncOperationKey, string> = {
   queued:
     'Waiting for a free sync slot. It will start automatically when one frees up.',
   deleting: 'This connector instance is being removed.',
+  purging: 'Synced records and indexes are being cleared. Configuration is kept.',
 };
 
 /** Sync-in-progress indicator for the instance card action row. Hidden when idle. */
@@ -100,7 +104,8 @@ export function InstanceSyncOperationIndicator({ instance }: { instance: Connect
   const isInProgress =
     syncOp.key === 'syncing' ||
     syncOp.key === 'full_syncing' ||
-    syncOp.key === 'queued';
+    syncOp.key === 'queued' ||
+    syncOp.key === 'purging';
 
   return (
     <Tooltip content={tooltipContent}>

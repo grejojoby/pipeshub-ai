@@ -44,6 +44,7 @@ import {
   updateConnectorInstanceAuthConfig,
   updateConnectorInstanceFiltersSyncConfig,
   deleteConnectorInstance,
+  purgeConnectorData,
   updateConnectorInstanceName,
   getOAuthAuthorizationUrl,
   handleOAuthCallback,
@@ -722,6 +723,19 @@ export function createConnectorRouter(
     ValidationMiddleware.validate(connectorIdParamSchema),
     deleteConnectorInstance(config, scheduler)
   );
+
+  /**
+   * POST /:connectorId/purge-data
+   * Clear synced records/indexes for a connector without removing its config.
+   */
+  router.post(
+    '/:connectorId/purge-data',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONNECTOR_DELETE),
+    ValidationMiddleware.validate(connectorIdParamSchema),
+    purgeConnectorData(config),
+  );
+
 
   // ============================================================================
   // Stats & Sync Routes

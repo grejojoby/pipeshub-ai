@@ -15,7 +15,8 @@ export type InstanceSyncOperationKey =
   | 'syncing'
   | 'full_syncing'
   | 'queued'
-  | 'deleting';
+  | 'deleting'
+  | 'purging';
 
 export type InstanceSetupStatusView = {
   key: InstanceSetupStatusKey;
@@ -65,6 +66,9 @@ export function deriveInstanceSyncOperation(
 
   if (normalized === CONNECTOR_INSTANCE_STATUS.DELETING) {
     return { key: 'deleting', badgeColor: 'red', icon: 'delete' };
+  }
+  if (normalized === CONNECTOR_INSTANCE_STATUS.PURGING) {
+    return { key: 'purging', badgeColor: 'amber', icon: 'delete_sweep' };
   }
   if (normalized === CONNECTOR_INSTANCE_STATUS.FULL_SYNCING) {
     return { key: 'full_syncing', badgeColor: 'blue', icon: 'cloud_sync' };

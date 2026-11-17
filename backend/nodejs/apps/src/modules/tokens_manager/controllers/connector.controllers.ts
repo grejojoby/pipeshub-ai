@@ -1006,6 +1006,55 @@ export const deleteConnectorInstance =
   };
 
 /**
+ * Purge synced data/indexes for a connector while keeping App/config/auth.
+ */
+export const purgeConnectorData =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { connectorId } = req.params;
+
+      if (!connectorId) {
+        throw new BadRequestError('Connector ID is required');
+      }
+
+      logger.info(`Purging connector data for ${connectorId}`);
+
+      const headers = buildProxyHeaders(req);
+
+      const connectorResponse = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/connectors/${encodeURIComponent(connectorId)}/purge-data`,
+        HttpMethod.POST,
+        headers,
+      );
+
+      handleConnectorResponse(
+        connectorResponse,
+        res,
+        'Purging connector data',
+        'Connector instance not found'
+      );
+    } catch (error: any) {
+      logger.error('Error purging connector data', {
+        error: error.message,
+        connectorId: req.params.connectorId,
+        userId: req.user?.userId,
+        status: error.response?.status,
+        data: error.response?.data,
+      });
+      const handledError = handleBackendError(
+        error,
+        'purge connector data',
+      );
+      next(handledError);
+    }
+  };
+
+/**
  * Update connector instance name.
  */
 export const updateConnectorInstanceName =

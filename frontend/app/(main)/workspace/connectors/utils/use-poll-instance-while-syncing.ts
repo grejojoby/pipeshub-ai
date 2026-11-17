@@ -14,11 +14,13 @@ function isSyncInProgressStatus(status?: string | null): boolean {
     normalized === CONNECTOR_INSTANCE_STATUS.SYNCING ||
     normalized === CONNECTOR_INSTANCE_STATUS.FULL_SYNCING ||
     // Queued too, or the card would never notice the sync actually starting.
-    normalized === CONNECTOR_INSTANCE_STATUS.QUEUED
+    normalized === CONNECTOR_INSTANCE_STATUS.QUEUED ||
+    // Purge clears indexes asynchronously; poll so the card leaves "Purging data".
+    normalized === CONNECTOR_INSTANCE_STATUS.PURGING
   );
 }
 
-/** Refetch one instance while its backend status is QUEUED / SYNCING / FULL_SYNCING: after 5 s, doubling up to every minute. */
+/** Refetch one instance while status is QUEUED / SYNCING / FULL_SYNCING / PURGING: after 5 s, doubling up to every minute. */
 export function usePollInstanceWhileSyncing(
   connectorId: string | undefined,
   status?: string | null

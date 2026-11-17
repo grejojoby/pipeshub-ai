@@ -25,6 +25,11 @@ interface SettingsTabProps {
   removeDisabled?: boolean;
   removeDisabledTooltip?: string;
   removePermissionLocked?: boolean;
+  /** Opens purge-data confirmation (parent owns the dialog). Keeps connector config. */
+  onRequestPurgeData?: () => void;
+  purgeDisabled?: boolean;
+  purgeDisabledTooltip?: string;
+  purgePermissionLocked?: boolean;
 }
 
 // ========================================
@@ -38,6 +43,10 @@ export function SettingsTab({
   removeDisabled = false,
   removeDisabledTooltip,
   removePermissionLocked = false,
+  onRequestPurgeData,
+  purgeDisabled = false,
+  purgeDisabledTooltip,
+  purgePermissionLocked = false,
 }: SettingsTabProps) {
   const { t, i18n } = useTranslation();
   const syncStrategy = getSyncStrategyLabel(t, config ?? undefined) ?? t('workspace.connectors.syncStrategies.MANUAL');
@@ -55,6 +64,39 @@ export function SettingsTab({
 
   const displayName = instance.name?.trim() ? instance.name.trim() : null;
   const displayAppGroup = instance.appGroup?.trim() ? instance.appGroup.trim() : null;
+
+  const showDangerZone = Boolean(onRequestPurgeData || onRequestRemoveConnector);
+
+  const purgeDataButton = onRequestPurgeData ? (
+    <Button
+      type="button"
+      color="red"
+      variant="soft"
+      disabled={purgeDisabled || purgePermissionLocked}
+      style={{
+        alignSelf: 'flex-start',
+        cursor: purgeDisabled || purgePermissionLocked ? 'not-allowed' : 'pointer',
+      }}
+      onClick={() => {
+        if (purgeDisabled || purgePermissionLocked) return;
+        onRequestPurgeData();
+      }}
+    >
+      {t('workspace.connectors.settingsTab.purgeData', {
+        defaultValue: 'Purge data',
+      })}
+      {purgePermissionLocked && <PermissionLockIcon />}
+    </Button>
+  ) : null;
+
+  const purgeDataControl =
+    purgeDataButton && purgeDisabled && purgeDisabledTooltip ? (
+      <Tooltip content={purgeDisabledTooltip}>
+        <span style={{ display: 'inline-flex' }}>{purgeDataButton}</span>
+      </Tooltip>
+    ) : (
+      purgeDataButton
+    );
 
   const removeConnectorButton = onRequestRemoveConnector ? (
     <Button
@@ -223,10 +265,10 @@ export function SettingsTab({
         </Flex>
       </SectionCard>
 
-      {onRequestRemoveConnector ? (
+      {showDangerZone ? (
         <Flex
           direction="column"
-          gap="3"
+          gap="4"
           p="3"
           style={{
             borderRadius: 'var(--radius-3)',
@@ -237,10 +279,25 @@ export function SettingsTab({
           <Text size="2" weight="bold" color="red">
             {t('workspace.actions.manage.dangerZone')}
           </Text>
-          <Text size="2" color="gray" style={{ maxWidth: 420 }}>
-            {t('workspace.connectors.settingsTab.removeInstanceDescription')}
-          </Text>
-          {removeConnectorControl}
+          {onRequestPurgeData ? (
+            <Flex direction="column" gap="3">
+              <Text size="2" color="gray" style={{ maxWidth: 420 }}>
+                {t('workspace.connectors.settingsTab.purgeDataDescription', {
+                  defaultValue:
+                    'Delete all synced records and indexes for this connector. Authentication and configuration are kept so you can sync again afterward.',
+                })}
+              </Text>
+              {purgeDataControl}
+            </Flex>
+          ) : null}
+          {onRequestRemoveConnector ? (
+            <Flex direction="column" gap="3">
+              <Text size="2" color="gray" style={{ maxWidth: 420 }}>
+                {t('workspace.connectors.settingsTab.removeInstanceDescription')}
+              </Text>
+              {removeConnectorControl}
+            </Flex>
+          ) : null}
         </Flex>
       ) : null}
     </Flex>

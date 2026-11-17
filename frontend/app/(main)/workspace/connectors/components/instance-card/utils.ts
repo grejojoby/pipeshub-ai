@@ -96,7 +96,10 @@ export function deriveSyncStatusState(
     : isConnectorInstanceOAuthAuthIncompleteForSyncUi(connectorConfig, instance);
 
   // 1. Backend-set hard states
-  if (instance.status === CONNECTOR_INSTANCE_STATUS.DELETING) {
+  if (
+    instance.status === CONNECTOR_INSTANCE_STATUS.DELETING ||
+    instance.status === CONNECTOR_INSTANCE_STATUS.PURGING
+  ) {
     return { status: 'sync_disabled', oauthAuthIncompleteForSync };
   }
   if (

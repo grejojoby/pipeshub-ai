@@ -11876,11 +11876,37 @@ class Neo4jProvider(NamedEntityGraphMixin, IGraphDBProvider):
                 self.logger.warning(f"kh scope: could not drop the scopes of deleted connector {connector_id}: {e}")
         return result
 
+    async def purge_connector_data(
+        self,
+        connector_id: str,
+        org_id: str,
+        transaction: str | None = None,
+    ) -> dict[str, Any]:
+        """Delete all synced data for a connector but keep the App node and config.
+
+        Removes records, groups, roles, sync points, stage states, and related graph
+        data. Keeps the connector instance, OAuth/config, and agent knowledge links so
+        the user can sync again without re-adding the connector.
+        """
+        result = await self._delete_connector_instance(
+            connector_id, org_id, transaction, keep_app=True,
+        )
+        if result.get("success"):
+            try:
+                await self.kh_scope_forget(connector_id)
+            except Exception as e:
+                self.logger.warning(
+                    f"kh scope: could not refresh scopes after purge of {connector_id}: {e}"
+                )
+        return result
+
     async def _delete_connector_instance(
         self,
         connector_id: str,
         org_id: str,
-        transaction: str | None = None
+        transaction: str | None = None,
+        *,
+        keep_app: bool = False,
     ) -> dict[str, Any]:
         created_transaction = False
 
@@ -12044,19 +12070,28 @@ class Neo4jProvider(NamedEntityGraphMixin, IGraphDBProvider):
 
                 # An agent names its sources by connectorId, not by a relationship, so
                 # nothing above reaches them; left behind they show as a raw id.
-                _, knowledge_success = await self._delete_nodes_by_connector_id(
-                    transaction,
-                    connector_id,
-                    CollectionNames.AGENT_KNOWLEDGE.value
-                )
-                if not knowledge_success:
-                    raise Exception("CRITICAL: Failed to remove the connector from agents.")
+                # Purge-data keeps the connector (and agent knowledge links).
+                if not keep_app:
+                    _, knowledge_success = await self._delete_nodes_by_connector_id(
+                        transaction,
+                        connector_id,
+                        CollectionNames.AGENT_KNOWLEDGE.value
+                    )
+                    if not knowledge_success:
+                        raise Exception("CRITICAL: Failed to remove the connector from agents.")
 
                 # User -> User link is not attached to any node deleted above
-                await self.remove_authenticated_as(connector_id, transaction=transaction)
+                # Purge keeps the connector identity / auth linkage.
+                if not keep_app:
+                    await self.remove_authenticated_as(connector_id, transaction=transaction)
 
-                # Step 7: Delete the app itself
-                if created_transaction:
+                # Step 7: Delete the app itself — skipped for purge-data (keep config).
+                if keep_app:
+                    await self.client.execute_query(
+                        f"MATCH (h:{_CONNECTOR_DELETE_HANDLE_LABEL} {{connectorId: $connector_id}}) DELETE h",
+                        parameters={"connector_id": connector_id},
+                    )
+                elif created_transaction:
                     await self._delete_connector_with_its_delete_handles(connector_id)
                 else:
                     await self._delete_nodes_by_keys(
@@ -12064,8 +12099,8 @@ class Neo4jProvider(NamedEntityGraphMixin, IGraphDBProvider):
                         [connector_id],
                         CollectionNames.APPS.value
                     )
-                # Gone is gone, whoever removed it.
-                await self._assert_none_remain(transaction, CollectionNames.APPS.value, [connector_id])
+                    # Gone is gone, whoever removed it.
+                    await self._assert_none_remain(transaction, CollectionNames.APPS.value, [connector_id])
 
                 # Commit transaction
                 if created_transaction:

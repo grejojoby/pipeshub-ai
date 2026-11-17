@@ -47,6 +47,7 @@ export function InstanceManagementPanel() {
     openPanel,
     openInstancePanel,
     removeConnectorInstance,
+    upsertConnectorInstance,
   } = useConnectorsStore();
 
   const [statsLoading, setStatsLoading] = useState(false);
@@ -55,6 +56,8 @@ export function InstanceManagementPanel() {
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [disableFirstDeleteOpen, setDisableFirstDeleteOpen] = useState(false);
+  const [purgeOpen, setPurgeOpen] = useState(false);
+  const [purgeBusy, setPurgeBusy] = useState(false);
 
   const nestedModalHost = useWorkspaceDrawerNestedModalHost(isInstancePanelOpen);
 
@@ -71,11 +74,20 @@ export function InstanceManagementPanel() {
   const openRemoveDialog = useCallback(() => {
     if (!canDeleteConnector) return;
     if (!selectedInstance?._key) return;
-    if (selectedInstance.status === CONNECTOR_INSTANCE_STATUS.DELETING) {
+    if (
+      selectedInstance.status === CONNECTOR_INSTANCE_STATUS.DELETING ||
+      selectedInstance.status === CONNECTOR_INSTANCE_STATUS.PURGING
+    ) {
       addToast({
         variant: 'info',
         title: t('workspace.connectors.removeInstanceDialog.alreadyRemovingTitle'),
-        description: t('workspace.connectors.removeInstanceDialog.alreadyRemovingDescription'),
+        description:
+          selectedInstance.status === CONNECTOR_INSTANCE_STATUS.PURGING
+            ? t('workspace.connectors.purgeDataDialog.alreadyPurgingDescription', {
+                defaultValue:
+                  'This connector is already clearing its synced data. Wait for that to finish.',
+              })
+            : t('workspace.connectors.removeInstanceDialog.alreadyRemovingDescription'),
       });
       return;
     }
@@ -88,12 +100,47 @@ export function InstanceManagementPanel() {
     setDeleteOpen(true);
   }, [selectedInstance, addToast, t, canDeleteConnector]);
 
-  const removeConnectorDisabled =
-    selectedInstance?.status === CONNECTOR_INSTANCE_STATUS.DELETING;
+  const openPurgeDialog = useCallback(() => {
+    if (!canDeleteConnector) return;
+    if (!selectedInstance?._key) return;
+    if (
+      selectedInstance.status === CONNECTOR_INSTANCE_STATUS.DELETING ||
+      selectedInstance.status === CONNECTOR_INSTANCE_STATUS.PURGING
+    ) {
+      addToast({
+        variant: 'info',
+        title: t('workspace.connectors.purgeDataDialog.alreadyBusyTitle', {
+          defaultValue: 'Connector busy',
+        }),
+        description:
+          selectedInstance.status === CONNECTOR_INSTANCE_STATUS.PURGING
+            ? t('workspace.connectors.purgeDataDialog.alreadyPurgingDescription', {
+                defaultValue:
+                  'This connector is already clearing its synced data. Wait for that to finish.',
+              })
+            : t('workspace.connectors.removeInstanceDialog.alreadyRemovingDescription'),
+      });
+      return;
+    }
+    setPurgeOpen(true);
+  }, [selectedInstance, addToast, t, canDeleteConnector]);
 
-  const removeConnectorDisabledTooltip = selectedInstance?.status === CONNECTOR_INSTANCE_STATUS.DELETING
+  const removeConnectorDisabled =
+    selectedInstance?.status === CONNECTOR_INSTANCE_STATUS.DELETING ||
+    selectedInstance?.status === CONNECTOR_INSTANCE_STATUS.PURGING;
+
+  const removeConnectorDisabledTooltip =
+    selectedInstance?.status === CONNECTOR_INSTANCE_STATUS.DELETING
       ? t('workspace.connectors.removeInstanceDialog.alreadyRemovingDescription')
-      : undefined;
+      : selectedInstance?.status === CONNECTOR_INSTANCE_STATUS.PURGING
+        ? t('workspace.connectors.purgeDataDialog.alreadyPurgingDescription', {
+            defaultValue:
+              'This connector is already clearing its synced data. Wait for that to finish.',
+          })
+        : undefined;
+
+  const purgeDataDisabled = removeConnectorDisabled;
+  const purgeDataDisabledTooltip = removeConnectorDisabledTooltip;
 
   const confirmRemoveConnector = useCallback(async () => {
     const id = pendingDeleteId;
@@ -150,6 +197,61 @@ export function InstanceManagementPanel() {
     closeInstancePanel,
     t,
   ]);
+
+  const confirmPurgeData = useCallback(async () => {
+    const id = selectedInstance?._key;
+    if (!id || purgeBusy) return;
+    setPurgeBusy(true);
+    try {
+      await ConnectorsApi.purgeConnectorData(id);
+      setPurgeOpen(false);
+      upsertConnectorInstance({
+        ...selectedInstance,
+        status: CONNECTOR_INSTANCE_STATUS.PURGING,
+      });
+      // Drop cached stats only — keep config so Settings still shows auth/sync.
+      useConnectorsStore.setState((s) => {
+        const nextStats = { ...s.instanceStats };
+        delete nextStats[id];
+        return { instanceStats: nextStats };
+      });
+      addToast({
+        variant: 'success',
+        title: t('workspace.connectors.purgeDataDialog.successTitle', {
+          defaultValue: 'Data purge started',
+        }),
+        description: t('workspace.connectors.purgeDataDialog.successDescription', {
+          defaultValue:
+            'Synced records and indexes are being cleared. Configuration and authentication are kept.',
+        }),
+        duration: 4000,
+      });
+    } catch (error: unknown) {
+      const fallback = t('workspace.connectors.purgeDataDialog.errorDescription', {
+        defaultValue:
+          'Please try again; if it keeps happening, contact your workspace admin.',
+      });
+      let description: string;
+      if (isAxiosError(error)) {
+        const fromBody = extractApiErrorMessage(error.response?.data);
+        description = getUserFacingErrorMessage(
+          fromBody ? { message: fromBody } : processError(error),
+          fallback,
+        );
+      } else {
+        description = getUserFacingErrorMessage(error, fallback);
+      }
+      addToast({
+        variant: 'error',
+        title: t('workspace.connectors.purgeDataDialog.errorTitle', {
+          defaultValue: 'Could not purge connector data',
+        }),
+        description,
+      });
+    } finally {
+      setPurgeBusy(false);
+    }
+  }, [selectedInstance, purgeBusy, upsertConnectorInstance, addToast, t]);
 
   const instanceId = selectedInstance?._key;
 
@@ -218,7 +320,9 @@ export function InstanceManagementPanel() {
         ? selectedInstance
         : (instances.find((i) => i._key === pendingDeleteId) ?? selectedInstance);
 
-  const manageConfigDisabled = selectedInstance.status === CONNECTOR_INSTANCE_STATUS.DELETING;
+  const manageConfigDisabled =
+    selectedInstance.status === CONNECTOR_INSTANCE_STATUS.DELETING ||
+    selectedInstance.status === CONNECTOR_INSTANCE_STATUS.PURGING;
 
   const titleNode =
     instances.length > 1 ? (
@@ -347,6 +451,12 @@ export function InstanceManagementPanel() {
             <SettingsTab
               instance={selectedInstance}
               config={instanceConfig}
+              onRequestPurgeData={
+                selectedInstance._key ? openPurgeDialog : undefined
+              }
+              purgeDisabled={purgeDataDisabled}
+              purgeDisabledTooltip={purgeDataDisabledTooltip}
+              purgePermissionLocked={!canDeleteConnector}
               onRequestRemoveConnector={
                 selectedInstance._key ? openRemoveDialog : undefined
               }
@@ -404,6 +514,44 @@ export function InstanceManagementPanel() {
                 </AlertDialog.Cancel>
                 <Button color="red" loading={deleteBusy} onClick={() => void confirmRemoveConnector()}>
                   {t('workspace.connectors.removeInstanceDialog.confirm')}
+                </Button>
+              </Flex>
+            </AlertDialog.Content>
+          </AlertDialog.Root>
+
+          {/* Purge synced data — keeps connector config/auth */}
+          <AlertDialog.Root
+            open={purgeOpen}
+            onOpenChange={(open) => {
+              if (!open && purgeBusy) return;
+              setPurgeOpen(open);
+            }}
+          >
+            <AlertDialog.Content container={nestedModalHost} style={{ maxWidth: 440 }}>
+              <AlertDialog.Title>
+                {t('workspace.connectors.purgeDataDialog.title', {
+                  defaultValue: 'Purge connector data?',
+                })}
+              </AlertDialog.Title>
+              <AlertDialog.Description size="2">
+                {t('workspace.connectors.purgeDataDialog.description', {
+                  defaultValue:
+                    'This deletes all synced records and indexes for {{name}}. Authentication and configuration stay so you can sync again afterward. This cannot be undone.',
+                  name: `"${selectedInstance.name}"`,
+                })}
+              </AlertDialog.Description>
+              <Flex gap="3" justify="end" mt="4">
+                <AlertDialog.Cancel>
+                  <Button variant="soft" color="gray" disabled={purgeBusy}>
+                    {t('workspace.connectors.purgeDataDialog.cancel', {
+                      defaultValue: 'Cancel',
+                    })}
+                  </Button>
+                </AlertDialog.Cancel>
+                <Button color="red" loading={purgeBusy} onClick={() => void confirmPurgeData()}>
+                  {t('workspace.connectors.purgeDataDialog.confirm', {
+                    defaultValue: 'Purge data',
+                  })}
                 </Button>
               </Flex>
             </AlertDialog.Content>
